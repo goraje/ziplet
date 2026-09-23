@@ -14,7 +14,7 @@ from cryptography.hazmat.primitives import hashes, hmac
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
-from ziplet.cryptography.base import BaseZipDecrypter, BaseZipEncryptor
+from ziplet.cryptography.base import BaseZipDecrypter, BaseZipEncryptor, _ReadableStream
 from ziplet.exceptions import BadZipFile
 
 if TYPE_CHECKING:
@@ -174,6 +174,7 @@ class AesZipDecrypter(BaseZipDecrypter):
                 bytes in *encryption_header*.
         """
         self.filename = zinfo.filename
+        self._wz_aes_version = zinfo.aes_extra.wz_aes_version
 
         if isinstance(pwd, str):
             pwd = pwd.encode("utf-8")
@@ -232,6 +233,14 @@ class AesZipDecrypter(BaseZipDecrypter):
         except KeyError:
             raise BadZipFile("Invalid AES strength") from None
 
+    @classmethod
+    def header_length(cls, zinfo: ZipInfo) -> int:
+        """Return the encryption header length for an entry.
+
+        Delegates to :meth:`encryption_header_length`.
+        """
+        return cls.encryption_header_length(zinfo)
+
     def decrypt(self, data: bytes) -> bytes:
         """Decrypt a chunk of ciphertext and update the running HMAC.
 
@@ -261,6 +270,22 @@ class AesZipDecrypter(BaseZipDecrypter):
             hmac_copy.finalize()[: self.hmac_size], hmac_check
         ):
             raise BadZipFile("Bad HMAC check for file %r" % self.filename)
+
+    def finalize(
+        self,
+        expected_crc: int | None,
+        running_crc: int | None,
+        fileobj: _ReadableStream,
+    ) -> None:
+        """Verify the HMAC tag, and for WZ-AES V1 also the CRC-32.
+
+        WZ-AES V2 relies on the HMAC alone; V1 predates that guarantee and
+        also carries a CRC-32, which the base implementation checks.
+        """
+        hmac_check = fileobj.read(self.hmac_size)
+        self.check_hmac(hmac_check)
+        if self._wz_aes_version == WZ_AES_V1:
+            super().finalize(expected_crc, running_crc, fileobj)
 
 
 class AesZipEncryptor(BaseZipEncryptor):

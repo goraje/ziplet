@@ -7,7 +7,9 @@ must satisfy.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Protocol
+
+from ziplet.exceptions import BadZipFile
 
 if TYPE_CHECKING:
     from ziplet.zipfile.info import ZipInfo
@@ -19,11 +21,19 @@ __all__ = [
 ]
 
 
+class _ReadableStream(Protocol):
+    """The minimal stream interface :meth:`BaseZipDecrypter.finalize` needs."""
+
+    def read(self, n: int = -1, /) -> bytes: ...
+
+
 class BaseZipDecrypter(ABC):
     """Abstract base class for ZIP entry decrypters.
 
-    Subclasses must implement :meth:`decrypt` to provide the decryption
-    logic for a specific algorithm.
+    Subclasses must implement :meth:`decrypt` and :meth:`header_length` to
+    provide the decryption logic for a specific algorithm. :meth:`finalize`
+    has a CRC-32 default (correct for ZipCrypto and WZ-AES V1); WZ-AES V2
+    overrides it to also verify the HMAC authentication tag.
     """
 
     authentication_trailer_length: int = 0
@@ -41,6 +51,52 @@ class BaseZipDecrypter(ABC):
         raise NotImplementedError(
             "BaseZipDecrypter implementations must implement `decrypt`."
         )
+
+    @classmethod
+    @abstractmethod
+    def header_length(cls, zinfo: "ZipInfo") -> int:
+        """Return the length in bytes of this algorithm's encryption header.
+
+        Args:
+            zinfo (ZipInfo): Metadata for the entry being read.
+
+        Returns:
+            int: Number of header bytes to read before the ciphertext.
+        """
+        raise NotImplementedError(
+            "BaseZipDecrypter implementations must implement `header_length`."
+        )
+
+    def finalize(
+        self,
+        expected_crc: int | None,
+        running_crc: int | None,
+        fileobj: _ReadableStream,
+    ) -> None:
+        """Verify integrity once the entry has been fully read.
+
+        The default checks CRC-32, which is correct for ZipCrypto and
+        WZ-AES V1. WZ-AES V2 overrides this to verify the HMAC tag instead.
+
+        Args:
+            expected_crc (int | None): The CRC-32 recorded for the entry,
+                or ``None`` if unavailable.
+            running_crc (int | None): The CRC-32 accumulated while reading,
+                or ``None`` before EOF is reached.
+            fileobj (_ReadableStream): The underlying stream, positioned
+                right after the ciphertext, for reading any trailing
+                authentication bytes.
+
+        Raises:
+            BadZipFile: If the CRC-32 does not match.
+        """
+        del fileobj
+        if (
+            expected_crc is not None
+            and running_crc is not None
+            and running_crc != expected_crc
+        ):
+            raise BadZipFile("Bad CRC-32")
 
 
 class BaseZipEncryptor(ABC):

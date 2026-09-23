@@ -14,3 +14,8 @@ wheels/
 .venv
 .python-version
 uv.lock
+
+# AI-related
+CLAUDE.md
+.claudeignore
+.token-optimizer

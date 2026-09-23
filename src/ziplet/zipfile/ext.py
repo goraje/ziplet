@@ -12,7 +12,6 @@ except ImportError:
     crc32 = binascii.crc32
 
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Any, Literal
 
 from typing_extensions import TypeAlias
@@ -29,7 +28,6 @@ from ziplet.compression.methods import (
     DecompressorBase,
     StreamingDecompressor,
 )
-from ziplet.cryptography import WZ_AES_V1
 from ziplet.cryptography.aes import AesZipDecrypter
 from ziplet.cryptography.zipcrypto import ZipCryptoDecrypter
 from ziplet.exceptions import BadZipFile
@@ -41,15 +39,6 @@ __all__ = [
 ]
 
 _ReadWriteMode: TypeAlias = Literal["r", "w"]
-
-
-@dataclass(frozen=True)
-class _EncryptionFrame:
-    """Algorithm-specific framing information for one encrypted member."""
-
-    decrypter: type[ZipCryptoDecrypter] | type[AesZipDecrypter]
-    header_length: Callable[[ZipInfo], int]
-    trailer_length: int
 
 
 class ZipExtFile(io.BufferedIOBase):
@@ -151,7 +140,6 @@ class ZipExtFile(io.BufferedIOBase):
             pass
 
         self._decrypter_cls: Callable[..., ZipCryptoDecrypter | AesZipDecrypter] | None
-        self._encryption_frame: _EncryptionFrame | None = None
         if self._zinfo.is_encrypted:
             self._decrypter_cls = self.setup_decrypter()
         else:
@@ -210,23 +198,22 @@ class ZipExtFile(io.BufferedIOBase):
             RuntimeError: If the entry is encrypted but no password was
                 supplied.
         """
-        frame = self._encryption_frame_for_entry()
-        self._encryption_frame = frame
-        if frame.decrypter is AesZipDecrypter:
+        decrypter_cls = self._decrypter_class_for_entry()
+        if decrypter_cls is AesZipDecrypter:
             if not self._pwd:
                 raise RuntimeError(
                     f"File {self.name!r} is encrypted with WZ_AES encryption and "
                     "requires a password."
                 )
-            encryption_header_length = frame.header_length(self._zinfo)
+            encryption_header_length = decrypter_cls.header_length(self._zinfo)
             self.encryption_header = self._fileobj.read(encryption_header_length)
             if len(self.encryption_header) != encryption_header_length:
                 raise BadZipFile("Truncated AES encryption header")
             self._orig_compress_left -= encryption_header_length
-            self._orig_compress_left -= frame.trailer_length
+            self._orig_compress_left -= decrypter_cls.authentication_trailer_length
             if self._orig_compress_left < 0:
                 raise BadZipFile("AES entry is shorter than its encryption overhead")
-            return frame.decrypter
+            return decrypter_cls
         else:
             if not self._pwd:
                 raise RuntimeError(
@@ -240,25 +227,19 @@ class ZipExtFile(io.BufferedIOBase):
                 != ZipCryptoDecrypter.encryption_header_length
             ):
                 raise BadZipFile("Truncated ZipCrypto encryption header")
-            self._orig_compress_left -= frame.header_length(self._zinfo)
+            self._orig_compress_left -= decrypter_cls.header_length(self._zinfo)
             if self._orig_compress_left < 0:
                 raise BadZipFile(
                     "ZipCrypto entry is shorter than its encryption header"
                 )
-            return frame.decrypter
+            return decrypter_cls
 
-    def _encryption_frame_for_entry(self) -> _EncryptionFrame:
+    def _decrypter_class_for_entry(
+        self,
+    ) -> type[ZipCryptoDecrypter] | type[AesZipDecrypter]:
         if self._zinfo.aes_extra.wz_aes_version is not None:
-            return _EncryptionFrame(
-                AesZipDecrypter,
-                AesZipDecrypter.encryption_header_length,
-                AesZipDecrypter.authentication_trailer_length,
-            )
-        return _EncryptionFrame(
-            ZipCryptoDecrypter,
-            lambda _info: ZipCryptoDecrypter.encryption_header_length,
-            ZipCryptoDecrypter.authentication_trailer_length,
-        )
+            return AesZipDecrypter
+        return ZipCryptoDecrypter
 
     def get_decrypter_kwargs(self) -> dict[str, Any]:
         """Return keyword arguments for the decrypter constructor.
@@ -312,9 +293,11 @@ class ZipExtFile(io.BufferedIOBase):
     def check_integrity(self) -> None:
         """Verify the integrity of a fully-read entry.
 
-        Called automatically by :meth:`_read1` once EOF is reached.  For
-        WZ-AES entries the HMAC authentication tag is validated; for ZipCrypto
-        entries (and WZ-AES V1) the CRC-32 is checked.
+        Called automatically by :meth:`_read1` once EOF is reached.
+        Delegates to the active decrypter's
+        :meth:`~ziplet.cryptography.base.BaseZipDecrypter.finalize`, which
+        validates the HMAC tag for WZ-AES V2 or the CRC-32 otherwise.
+        Unencrypted entries check the CRC-32 directly.
 
         For LZMA entries inside a WZ-AES stream any trailing end-of-stream
         marker or padding bytes are consumed so that the HMAC covers the
@@ -323,39 +306,34 @@ class ZipExtFile(io.BufferedIOBase):
         Raises:
             BadZipFile: If the HMAC tag does not match, or if the CRC-32 of
                 the decompressed data does not equal the expected value.
-            RuntimeError: If the internal decrypter is in an unexpected state
-                (should not occur under normal use).
         """
-        if self._zinfo.aes_extra.wz_aes_version is not None:
-            if self._zinfo.compress_type == ZIP_LZMA:
-                # LZMA may have an end-of-stream marker or padding.  Read it
-                # all so the HMAC covers the full compressed byte stream.
-                while self._compress_left > 0:
-                    data = self._read2(self.MIN_READ_SIZE)
-                    assert self._decompressor is not None
-                    data = self._decompressor.decompress(data)
-                    if data:
-                        raise BadZipFile(
-                            f"More data found than indicated by uncompressed size "
-                            f"for '{self.name}'"
-                        )
-            if not isinstance(self._decrypter, AesZipDecrypter):
-                raise RuntimeError("Decrypter was not set for encrypted file.")
-            hmac_check = self._fileobj.read(self._decrypter.hmac_size)
-            self._decrypter.check_hmac(hmac_check)
-            if self._zinfo.aes_extra.wz_aes_version == WZ_AES_V1:
-                # V1 also validates the CRC
-                if (
-                    self._expected_crc is not None
-                    and self._eof
-                    and self._running_crc != self._expected_crc
-                ):
-                    raise BadZipFile(f"Bad CRC-32 for file {self.name!r}")
-        else:
-            if self._expected_crc is None:
-                return
-            if self._eof and self._running_crc != self._expected_crc:
-                raise BadZipFile(f"Bad CRC-32 for file {self.name!r}")
+        if (
+            self._zinfo.aes_extra.wz_aes_version is not None
+            and self._zinfo.compress_type == ZIP_LZMA
+        ):
+            # LZMA may have an end-of-stream marker or padding.  Read it
+            # all so the HMAC covers the full compressed byte stream.
+            while self._compress_left > 0:
+                data = self._read2(self.MIN_READ_SIZE)
+                assert self._decompressor is not None
+                data = self._decompressor.decompress(data)
+                if data:
+                    raise BadZipFile(
+                        f"More data found than indicated by uncompressed size "
+                        f"for '{self.name}'"
+                    )
+        if self._decrypter is not None:
+            self._decrypter.finalize(
+                self._expected_crc,
+                self._running_crc if self._eof else None,
+                self._fileobj,
+            )
+        elif (
+            self._eof
+            and self._expected_crc is not None
+            and self._running_crc != self._expected_crc
+        ):
+            raise BadZipFile(f"Bad CRC-32 for file {self.name!r}")
 
     def __repr__(self) -> str:
         """Return a developer-friendly string representation.

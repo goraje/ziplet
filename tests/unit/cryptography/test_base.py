@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import io
+
 import pytest
 
 from ziplet.cryptography.base import BaseZipDecrypter, BaseZipEncryptor
+from ziplet.exceptions import BadZipFile
 
 
 class TestBaseZipDecrypter:
@@ -12,7 +15,17 @@ class TestBaseZipDecrypter:
 
     def test_subclass_missing_decrypt_cannot_instantiate(self) -> None:
         class Incomplete(BaseZipDecrypter):
-            pass
+            @classmethod
+            def header_length(cls, zinfo: object) -> int:
+                return 0
+
+        with pytest.raises(TypeError):
+            Incomplete()  # type: ignore[abstract]  # ty: ignore[call-non-callable]
+
+    def test_subclass_missing_header_length_cannot_instantiate(self) -> None:
+        class Incomplete(BaseZipDecrypter):
+            def decrypt(self, data: bytes) -> bytes:
+                return data
 
         with pytest.raises(TypeError):
             Incomplete()  # type: ignore[abstract]  # ty: ignore[call-non-callable]
@@ -22,6 +35,10 @@ class TestBaseZipDecrypter:
             def decrypt(self, data: bytes) -> bytes:
                 return data
 
+            @classmethod
+            def header_length(cls, zinfo: object) -> int:
+                return 0
+
         obj = Concrete()
         assert obj.decrypt(b"hello") == b"hello"
 
@@ -30,7 +47,26 @@ class TestBaseZipDecrypter:
             def decrypt(self, data: bytes) -> bytes:
                 return data
 
+            @classmethod
+            def header_length(cls, zinfo: object) -> int:
+                return 0
+
         assert Concrete().decrypt(b"\x00\x01\x02") == b"\x00\x01\x02"
+
+    def test_finalize_default_checks_crc32(self) -> None:
+        class Concrete(BaseZipDecrypter):
+            def decrypt(self, data: bytes) -> bytes:
+                return data
+
+            @classmethod
+            def header_length(cls, zinfo: object) -> int:
+                return 0
+
+        obj = Concrete()
+        obj.finalize(123, 123, io.BytesIO())
+        with pytest.raises(BadZipFile, match="Bad CRC-32"):
+            obj.finalize(123, 456, io.BytesIO())
+        obj.finalize(None, None, io.BytesIO())
 
 
 class TestBaseZipEncryptor:

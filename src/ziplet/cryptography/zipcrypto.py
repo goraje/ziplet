@@ -142,6 +142,12 @@ class ZipCryptoDecrypter(BaseZipDecrypter):
         if h[11] != check_byte:
             raise RuntimeError("Bad password for file %r" % zinfo.filename)
 
+    @classmethod
+    def header_length(cls, zinfo: ZipInfo) -> int:
+        """Return the encryption header length. Always 12 bytes for ZipCrypto."""
+        del zinfo
+        return cls.encryption_header_length
+
     def crc32(self, ch: int, crc: int) -> int:
         """Compute the CRC32 primitive on one byte.
 
