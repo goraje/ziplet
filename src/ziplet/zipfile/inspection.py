@@ -7,11 +7,9 @@ from pathlib import Path
 
 from ziplet.zipfile.assessment import ArchiveAssessment
 from ziplet.zipfile.extract import (
-    ExtractPolicy,
     ExtractViolation,
     ViolationAction,
     compression_ratio,
-    resolve_rule,
 )
 from ziplet.zipfile.shared import MASK_ENCRYPTED
 
@@ -65,24 +63,11 @@ class InspectionResult:
     member_count_over_limit: bool
 
 
-def build_inspection_result(
-    assessment: ArchiveAssessment, policy: ExtractPolicy
-) -> InspectionResult:
+def build_inspection_result(assessment: ArchiveAssessment) -> InspectionResult:
     """Summarise *assessment* as an :class:`InspectionResult`."""
     total_entries = len(assessment.members)
-    max_entries = resolve_rule(policy.max_entries, policy.on_violation)
-    count_over = max_entries.value is not None and total_entries > max_entries.value
-    violations = list(assessment.violations)
-    if count_over:
-        violations.append(
-            ExtractViolation(
-                "<archive>",
-                "max_entries",
-                f"archive contains {total_entries} entries, "
-                f"limit is {max_entries.value}",
-                max_entries.action,
-            )
-        )
+    violations = assessment.violations
+    count_over = any(violation.code == "max_entries" for violation in violations)
 
     members: list[InspectionMember] = []
     encrypted: list[str] = []
@@ -137,6 +122,6 @@ def build_inspection_result(
         tuple(symlinks),
         tuple(special_files),
         tuple(v for v in violations if v.action == ViolationAction.WARN),
-        tuple(violations),
+        violations,
         count_over,
     )

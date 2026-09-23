@@ -317,6 +317,9 @@ for member in assessment.members:
 ```
 
 `ViolationAction.ERROR`, `WARN`, and `SKIP` control ordinary policy findings.
+`max_entries` applies to the archive as a whole and is reported once: `ERROR`
+extracts nothing, `SKIP` extracts only the first `max_entries` members, and
+`WARN` warns and extracts everything.
 Security-critical path and file-type findings remain errors when `WARN` is
 selected. `preview_only=True` performs assessment and returns member results
 without creating or modifying the destination. An `ExtractionError` contains

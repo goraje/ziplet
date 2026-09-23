@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import os
 import stat
 from pathlib import Path
@@ -301,3 +302,64 @@ def test_fsync_files_policy_controls_fsync(
 
     assert len(calls) == expected_calls
     assert (tmp_path / "out" / "two.txt").read_bytes() == b"2"
+
+
+def _five_entry_archive() -> io.BytesIO:
+    buffer = io.BytesIO()
+    with ziplet.ZipFile(buffer, "w") as zf:
+        for index in range(5):
+            zf.writestr(f"f{index}.txt", b"x")
+    return io.BytesIO(buffer.getvalue())
+
+
+def _count_violations(result: ziplet.ExtractResult) -> list[str]:
+    return [v.member for v in result.violations if v.code == "max_entries"]
+
+
+def test_max_entries_error_extracts_nothing_and_reports_once(tmp_path: Path) -> None:
+    policy = ziplet.ExtractPolicy(max_entries=3)
+    with ziplet.ZipFile(_five_entry_archive()) as zf:
+        with pytest.raises(ziplet.ExtractionError) as excinfo:
+            zf.extractall(tmp_path / "out", policy=policy)
+
+    result = excinfo.value.result
+    assert not (tmp_path / "out").exists() or not list((tmp_path / "out").iterdir())
+    assert (result.extracted_count, result.failed_count) == (0, 5)
+    assert _count_violations(result) == ["<archive>"]
+    assert all(m.status == ziplet.MemberStatus.FAILED for m in result.members)
+
+
+def test_max_entries_skip_extracts_only_the_first_entries(tmp_path: Path) -> None:
+    policy = ziplet.ExtractPolicy(
+        max_entries=3, on_violation=ziplet.ViolationAction.SKIP
+    )
+    with ziplet.ZipFile(_five_entry_archive()) as zf:
+        result = zf.extractall(tmp_path, policy=policy)
+
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["f0.txt", "f1.txt", "f2.txt"]
+    assert (result.extracted_count, result.skipped_count) == (3, 2)
+    assert _count_violations(result) == ["<archive>"]
+
+
+def test_max_entries_warn_extracts_everything_with_one_warning(tmp_path: Path) -> None:
+    policy = ziplet.ExtractPolicy(
+        max_entries=3, on_violation=ziplet.ViolationAction.WARN
+    )
+    with ziplet.ZipFile(_five_entry_archive()) as zf:
+        with pytest.warns(UserWarning, match="limit is 3") as caught:
+            result = zf.extractall(tmp_path, policy=policy)
+
+    assert len(caught) == 1
+    assert result.extracted_count == 5
+    assert _count_violations(result) == ["<archive>"]
+
+
+def test_inspection_reports_entry_count_once() -> None:
+    policy = ziplet.ExtractPolicy(max_entries=3)
+    with ziplet.ZipFile(_five_entry_archive()) as zf:
+        report = zf.inspect(policy=policy)
+
+    assert report.member_count_over_limit
+    assert [v.member for v in report.violations if v.code == "max_entries"] == [
+        "<archive>"
+    ]

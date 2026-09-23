@@ -22,7 +22,6 @@ from ziplet.cryptography.zipcrypto import ZipCryptoDecrypter
 from ziplet.exceptions import BadZipFile
 from ziplet.zipfile.info import ZipInfo
 from ziplet.zipfile.io_wrappers import ClosableZipStream
-from ziplet.zipfile.records import raise_for_unsupported_flags
 from ziplet.zipfile.shared import ReadWriteMode, crc32
 
 __all__ = [
@@ -93,16 +92,17 @@ class ZipExtFile(io.BufferedIOBase):
         Raises:
             RuntimeError: If the entry is encrypted but *pwd* is ``None`` or
                 empty.
-            NotImplementedError: If the entry uses compressed-patch data
-                (flag bit 5) or strong encryption (flag bit 6).
+
+        Note:
+            The local file header must already have been validated, which
+            :meth:`ZipFile.open` does; that is also where entries using
+            compressed-patch data or strong encryption are rejected.
         """
         self._fileobj = fileobj
         self._zinfo: ZipInfo = zipinfo
         self._close_fileobj = close_fileobj
         self._pwd = pwd
         self._compression_registry = compression_registry
-
-        raise_for_unsupported_flags(zipinfo)
 
         self._compress_type = zipinfo.compress_type
         self._orig_compress_left = zipinfo.compress_size

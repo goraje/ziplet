@@ -22,7 +22,6 @@ class ExtractionContext:
 class ValidationState:
     """Mutable archive-wide state used while assessing members."""
 
-    member_index: int = 0
     total_declared: int = 0
     total_compressed: int = 0
     targets: dict[Path, str] = field(default_factory=dict)

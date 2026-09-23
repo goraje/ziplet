@@ -327,24 +327,6 @@ def check_custom_validator(params: ValidatorParams) -> Iterable[ExtractViolation
             )
 
 
-def check_max_entries(params: ValidatorParams) -> Iterable[ExtractViolation]:
-    info, target, context, state = (
-        params.info,
-        params.target,
-        params.context,
-        params.state,
-    )
-    rule = resolve_rule(context.policy.max_entries, context.policy.on_violation)
-    if rule.value is not None and state.member_index >= rule.value:
-        yield _violation(
-            info,
-            "max_entries",
-            "archive entry count exceeds policy limit",
-            target,
-            rule.action,
-        )
-
-
 def check_total_uncompressed_size(
     params: ValidatorParams,
 ) -> Iterable[ExtractViolation]:
@@ -382,6 +364,5 @@ EXTRACT_VALIDATORS: tuple[MemberValidator, ...] = (
     check_special_file_allowed,
     check_utf8_name,
     check_custom_validator,
-    check_max_entries,
     check_total_uncompressed_size,
 )

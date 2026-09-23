@@ -19,6 +19,7 @@ from ziplet.zipfile.extract import (
     OverwritePolicy,
     ViolationAction,
     normalized_destination,
+    resolve_rule,
 )
 from ziplet.zipfile.info import ZipInfo
 from ziplet.zipfile.validators import (
@@ -29,7 +30,12 @@ from ziplet.zipfile.validators import (
     resolve_extract_target,
 )
 
-__all__ = ["assess_archive", "assess_member", "default_assessment_policy"]
+__all__ = [
+    "assess_archive",
+    "assess_member",
+    "default_assessment_policy",
+    "entry_count_violation",
+]
 
 # Findings that can never be downgraded to warnings, regardless of policy.
 _HARD_VIOLATIONS = frozenset(
@@ -58,6 +64,19 @@ def default_assessment_policy() -> ExtractPolicy:
         max_total_uncompressed_size=None,
         max_entries=None,
         max_compression_ratio=None,
+    )
+
+
+def entry_count_violation(count: int, policy: ExtractPolicy) -> ExtractViolation | None:
+    """Return the archive-level ``max_entries`` finding for *count* entries."""
+    rule = resolve_rule(policy.max_entries, policy.on_violation)
+    if rule.value is None or count <= rule.value:
+        return None
+    return ExtractViolation(
+        "<archive>",
+        "max_entries",
+        f"archive contains {count} entries, limit is {rule.value}",
+        rule.action,
     )
 
 
@@ -112,13 +131,15 @@ def assess_archive(
         state.total_declared += info.file_size
         state.total_compressed += info.compress_size
         assessment = assess_member(info, destination, root, policy, state)
-        state.member_index += 1
         if assessment.target is not None:
             if assessment.target in seen_targets:
                 duplicate_targets.append(assessment.target)
             seen_targets.add(assessment.target)
         members.append(assessment)
         violations.extend(assessment.violations)
+    count_violation = entry_count_violation(len(infos), policy)
+    if count_violation is not None:
+        violations.append(count_violation)
     return ArchiveAssessment(
         destination,
         tuple(members),

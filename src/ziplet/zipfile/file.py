@@ -395,9 +395,7 @@ class ZipFile:
         :class:`ExtractionError`.
         """
         effective_policy = policy or default_assessment_policy()
-        return build_inspection_result(
-            self.assess(path, effective_policy), effective_policy
-        )
+        return build_inspection_result(self.assess(path, effective_policy))
 
     def assess(
         self,

@@ -8,7 +8,7 @@ from pathlib import Path
 
 from ziplet.exceptions import BadZipFile
 from ziplet.zipfile.assessment import ValidationState
-from ziplet.zipfile.assessor import assess_member
+from ziplet.zipfile.assessor import assess_member, entry_count_violation
 from ziplet.zipfile.exceptions import ExtractionFailure, ExtractionQuotaExceeded
 from ziplet.zipfile.extract import (
     ExtractMemberResult,
@@ -75,6 +75,29 @@ def _unique_target(target: Path, policy: ExtractPolicy) -> Path:
     return candidate
 
 
+def _rejected_result(
+    infos: Sequence[ZipInfo],
+    destination: Path,
+    policy: ExtractPolicy,
+    violation: ExtractViolation,
+) -> ExtractResult:
+    """Result for an archive rejected as a whole; nothing was extracted."""
+    members = tuple(
+        _member_result(info, MemberStatus.FAILED, None, 0, (violation,))
+        for info in infos
+    )
+    return ExtractResult(
+        destination,
+        members,
+        (violation,),
+        0,
+        0,
+        len(members),
+        0,
+        policy.preview_only,
+    )
+
+
 def extract_with_policy(
     infos: Sequence[ZipInfo],
     destination: Path,
@@ -92,26 +115,31 @@ def extract_with_policy(
     state = ValidationState()
     total_written = 0
 
-    max_entries = resolve_rule(policy.max_entries, policy.on_violation)
-    if max_entries.value is not None and len(infos) > max_entries.value:
-        violations.append(
-            ExtractViolation(
-                "<archive>",
-                "max_entries",
-                f"archive contains {len(infos)} entries, limit is {max_entries.value}",
-                max_entries.action,
-            )
-        )
+    # The entry-count limit applies to the archive as a whole: ERROR rejects
+    # everything before any file is written, SKIP keeps only the first N
+    # entries, and WARN just reports it.
+    entry_limit: int | None = None
+    count_violation = entry_count_violation(len(infos), policy)
+    if count_violation is not None:
+        violations.append(count_violation)
+        if count_violation.action == ViolationAction.ERROR:
+            return _rejected_result(infos, destination, policy, count_violation)
+        if count_violation.action == ViolationAction.SKIP:
+            entry_limit = resolve_rule(policy.max_entries, policy.on_violation).value
+        else:
+            warnings.warn(count_violation.message, stacklevel=_WARN_STACKLEVEL)
     member_limit = resolve_rule(policy.max_member_size, policy.on_violation).value
     total_limit = resolve_rule(
         policy.max_total_uncompressed_size, policy.on_violation
     ).value
 
-    for info in infos:
+    for index, info in enumerate(infos):
+        if entry_limit is not None and index >= entry_limit:
+            results.append(_member_result(info, MemberStatus.SKIPPED, None, 0, ()))
+            continue
         state.total_declared += info.file_size
         state.total_compressed += info.compress_size
         assessment = assess_member(info, destination, policy_root, policy, state)
-        state.member_index += 1
         target = assessment.target
         member_violations = assessment.violations
         violations.extend(member_violations)
