@@ -71,7 +71,11 @@ from ziplet.zipfile.io_wrappers import (
     ClosableZipStream,
     Tellable,
 )
-from ziplet.zipfile.materialize import MaterializationResult, Materializer
+from ziplet.zipfile.materialize import (
+    MaterializationResult,
+    MaterializeParams,
+    Materializer,
+)
 from ziplet.zipfile.secure_fs import SecureExtractionRoot
 from ziplet.zipfile.shared import (
     MASK_COMPRESS_OPTION_1,
@@ -102,6 +106,7 @@ from ziplet.zipfile.shared import (
 )
 from ziplet.zipfile.validators import (
     EXTRACT_VALIDATORS,
+    ValidatorParams,
     ValidatorPipeline,
     _entry_mode,
     _entry_type,
@@ -538,7 +543,8 @@ class ZipFile:
     ) -> MemberAssessment:
         target, _drive, _parts = resolve_extract_target(info, destination)
         context = ExtractionContext(destination, policy_root, None, policy)
-        violations = self._extract_pipeline.validate(info, target, context, state)
+        params = ValidatorParams(info, target, context, state)
+        violations = self._extract_pipeline.validate(params)
         violations = self._apply_hard_violation_floor(violations)
         return MemberAssessment(
             info,
@@ -1795,7 +1801,7 @@ class ZipFile:
             dir_fd = self._secure_mkdirs(upperdirs)
         try:
             materializer = self._materializer(member)
-            return materializer(
+            params = MaterializeParams(
                 member,
                 targetpath,
                 pwd,
@@ -1805,6 +1811,7 @@ class ZipFile:
                 upperdirs or ".",
                 dir_fd,
             )
+            return materializer(params)
         finally:
             if dir_fd is not None:
                 os.close(dir_fd)
@@ -1820,18 +1827,9 @@ class ZipFile:
         return self._materialize_regular_file
 
     def _materialize_directory(
-        self,
-        member: ZipInfo,
-        targetpath: str,
-        pwd: bytes | None,
-        quota_member_limit: int | None,
-        quota_total_limit: int | None,
-        quota_total_written: int,
-        directory: str,
-        dir_fd: int | None,
+        self, params: MaterializeParams
     ) -> MaterializationResult:
-        del member, pwd, quota_member_limit, quota_total_limit, quota_total_written
-        del directory
+        targetpath, dir_fd = params.targetpath, params.dir_fd
         if dir_fd is not None and os.mkdir in os.supports_dir_fd:
             name = os.path.basename(targetpath)
             try:
@@ -1865,19 +1863,9 @@ class ZipFile:
                     raise
         return MaterializationResult(Path(targetpath), 0, existed)
 
-    def _materialize_symlink(
-        self,
-        member: ZipInfo,
-        targetpath: str,
-        pwd: bytes | None,
-        quota_member_limit: int | None,
-        quota_total_limit: int | None,
-        quota_total_written: int,
-        directory: str,
-        dir_fd: int | None,
-    ) -> MaterializationResult:
-        del quota_member_limit, quota_total_limit, quota_total_written, directory
-        with self.open(member, pwd=pwd) as source:
+    def _materialize_symlink(self, params: MaterializeParams) -> MaterializationResult:
+        member, targetpath, dir_fd = params.member, params.targetpath, params.dir_fd
+        with self.open(member, pwd=params.pwd) as source:
             link_target = os.fsdecode(source.read())
         if os.path.isabs(link_target) or ".." in link_target.replace("\\", "/").split(
             "/"
@@ -1902,19 +1890,8 @@ class ZipFile:
         os.symlink(link_target, targetpath)
         return MaterializationResult(Path(targetpath), 0, existed)
 
-    def _materialize_special(
-        self,
-        member: ZipInfo,
-        targetpath: str,
-        pwd: bytes | None,
-        quota_member_limit: int | None,
-        quota_total_limit: int | None,
-        quota_total_written: int,
-        directory: str,
-        dir_fd: int | None,
-    ) -> MaterializationResult:
-        del pwd, quota_member_limit, quota_total_limit, quota_total_written, directory
-        del dir_fd
+    def _materialize_special(self, params: MaterializeParams) -> MaterializationResult:
+        member, targetpath = params.member, params.targetpath
         # ponytail: no dir_fd path for FIFO creation (os.mkfifo lacks a
         # dir_fd parameter; os.mknod's dir_fd support is Linux-only and
         # unconfirmed on this platform). Residual TOCTOU window between the
@@ -1929,35 +1906,31 @@ class ZipFile:
         raise ExtractionMaterializationError("Unsupported special file type")
 
     def _materialize_regular_file(
-        self,
-        member: ZipInfo,
-        targetpath: str,
-        pwd: bytes | None,
-        quota_member_limit: int | None,
-        quota_total_limit: int | None,
-        quota_total_written: int,
-        directory: str,
-        dir_fd: int | None,
+        self, params: MaterializeParams
     ) -> MaterializationResult:
-        del dir_fd
+        member, targetpath = params.member, params.targetpath
+        quota_member_limit, quota_total_limit = (
+            params.quota_member_limit,
+            params.quota_total_limit,
+        )
         existed = os.path.lexists(targetpath)
         temp_name: str | None = None
         bytes_written = 0
         try:
             with tempfile.NamedTemporaryFile(
-                mode="wb", dir=directory, prefix=".ziplet-", delete=False
+                mode="wb", dir=params.directory, prefix=".ziplet-", delete=False
             ) as target:
                 temp_name = target.name
                 if quota_member_limit is None and quota_total_limit is None:
-                    with self.open(member, pwd=pwd) as source:
+                    with self.open(member, pwd=params.pwd) as source:
                         shutil.copyfileobj(source, target)
                 else:
-                    with self.open(member, pwd=pwd) as source:
+                    with self.open(member, pwd=params.pwd) as source:
                         quota_target = _ExtractionQuotaWriter(
                             target,
                             member_limit=quota_member_limit,
                             total_limit=quota_total_limit,
-                            total_written=quota_total_written,
+                            total_written=params.quota_total_written,
                         )
                         shutil.copyfileobj(source, quota_target)
                 target.flush()

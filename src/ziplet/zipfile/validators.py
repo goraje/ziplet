@@ -5,8 +5,9 @@ from __future__ import annotations
 import os
 import stat
 from collections.abc import Callable, Iterable
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, cast
+from typing import Protocol
 
 from ziplet.exceptions import BadZipFile
 from ziplet.zipfile.assessment import ExtractionContext, ValidationState
@@ -24,16 +25,24 @@ _WINDOWS_ILLEGAL_NAME_TABLE = str.maketrans(
 )
 
 
+@dataclass(frozen=True)
+class ValidatorParams:
+    """Bundles one member validator call's arguments.
+
+    A validator only reads the fields it needs — no unused-parameter
+    ceremony for the checks that ignore ``target`` or ``state``.
+    """
+
+    info: ZipInfo
+    target: Path
+    context: ExtractionContext
+    state: ValidationState
+
+
 class MemberValidator(Protocol):
     """Protocol implemented by one metadata-only member validator."""
 
-    def __call__(
-        self,
-        info: ZipInfo,
-        target: Path,
-        context: ExtractionContext,
-        state: ValidationState,
-    ) -> Iterable[ExtractViolation]: ...
+    def __call__(self, params: ValidatorParams) -> Iterable[ExtractViolation]: ...
 
 
 class ValidatorPipeline:
@@ -42,32 +51,21 @@ class ValidatorPipeline:
     def __init__(self, validators: Iterable[MemberValidator]) -> None:
         self._validators = tuple(validators)
 
-    def validate(
-        self,
-        info: ZipInfo,
-        target: Path,
-        context: ExtractionContext,
-        state: ValidationState,
-    ) -> list[ExtractViolation]:
+    def validate(self, params: ValidatorParams) -> list[ExtractViolation]:
         violations: list[ExtractViolation] = []
         for validator in self._validators:
-            violations.extend(validator(info, target, context, state))
+            violations.extend(validator(params))
         return violations
 
 
 def custom_validator(callback: Callable[[ZipInfo, Path], None]) -> MemberValidator:
     """Adapt the established two-argument custom-validator API."""
 
-    def validate(
-        info: ZipInfo,
-        target: Path,
-        _context: ExtractionContext,
-        _state: ValidationState,
-    ) -> Iterable[ExtractViolation]:
-        callback(info, target)
+    def validate(params: ValidatorParams) -> Iterable[ExtractViolation]:
+        callback(params.info, params.target)
         return ()
 
-    return cast(MemberValidator, validate)
+    return validate
 
 
 def _violation(
@@ -126,10 +124,8 @@ def resolve_extract_target(
     return target, drive, parts
 
 
-def check_absolute_path(
-    info: ZipInfo, target: Path, context: ExtractionContext, state: ValidationState
-) -> Iterable[ExtractViolation]:
-    del target, state
+def check_absolute_path(params: ValidatorParams) -> Iterable[ExtractViolation]:
+    info, context = params.info, params.context
     rule = resolve_rule(
         context.policy.allow_absolute_paths, context.policy.on_violation
     )
@@ -139,10 +135,8 @@ def check_absolute_path(
         )
 
 
-def check_windows_drive_and_unc(
-    info: ZipInfo, target: Path, context: ExtractionContext, state: ValidationState
-) -> Iterable[ExtractViolation]:
-    del target, state
+def check_windows_drive_and_unc(params: ValidatorParams) -> Iterable[ExtractViolation]:
+    info, context = params.info, params.context
     raw = info.orig_filename
     drive, _ = os.path.splitdrive(raw)
     rule = resolve_rule(
@@ -161,10 +155,8 @@ def check_windows_drive_and_unc(
         )
 
 
-def check_parent_traversal(
-    info: ZipInfo, target: Path, context: ExtractionContext, state: ValidationState
-) -> Iterable[ExtractViolation]:
-    del target, state
+def check_parent_traversal(params: ValidatorParams) -> Iterable[ExtractViolation]:
+    info, context = params.info, params.context
     raw = info.orig_filename
     rule = resolve_rule(
         context.policy.allow_parent_traversal, context.policy.on_violation
@@ -178,10 +170,8 @@ def check_parent_traversal(
         )
 
 
-def check_outside_root(
-    info: ZipInfo, target: Path, context: ExtractionContext, state: ValidationState
-) -> Iterable[ExtractViolation]:
-    del state
+def check_outside_root(params: ValidatorParams) -> Iterable[ExtractViolation]:
+    info, target, context = params.info, params.target, params.context
     try:
         target.relative_to(context.policy_root.resolve())
     except ValueError:
@@ -194,9 +184,13 @@ def check_outside_root(
         )
 
 
-def check_duplicate_target(
-    info: ZipInfo, target: Path, context: ExtractionContext, state: ValidationState
-) -> Iterable[ExtractViolation]:
+def check_duplicate_target(params: ValidatorParams) -> Iterable[ExtractViolation]:
+    info, target, context, state = (
+        params.info,
+        params.target,
+        params.context,
+        params.state,
+    )
     rule = resolve_rule(
         context.policy.reject_duplicate_targets, context.policy.on_violation
     )
@@ -212,11 +206,8 @@ def check_duplicate_target(
         state.targets[target] = info.filename
 
 
-def check_overwrite_conflict(
-    info: ZipInfo, target: Path, context: ExtractionContext, state: ValidationState
-) -> Iterable[ExtractViolation]:
-    del state
-    policy = context.policy
+def check_overwrite_conflict(params: ValidatorParams) -> Iterable[ExtractViolation]:
+    info, target, policy = params.info, params.target, params.context.policy
     if (
         target.exists()
         and not policy.allow_overwrite
@@ -233,10 +224,8 @@ def check_overwrite_conflict(
         )
 
 
-def check_max_member_size(
-    info: ZipInfo, target: Path, context: ExtractionContext, state: ValidationState
-) -> Iterable[ExtractViolation]:
-    del state
+def check_max_member_size(params: ValidatorParams) -> Iterable[ExtractViolation]:
+    info, target, context = params.info, params.target, params.context
     rule = resolve_rule(context.policy.max_member_size, context.policy.on_violation)
     if rule.value is not None and info.file_size > rule.value:
         yield _violation(
@@ -244,10 +233,8 @@ def check_max_member_size(
         )
 
 
-def check_compression_ratio(
-    info: ZipInfo, target: Path, context: ExtractionContext, state: ValidationState
-) -> Iterable[ExtractViolation]:
-    del state
+def check_compression_ratio(params: ValidatorParams) -> Iterable[ExtractViolation]:
+    info, target, context = params.info, params.target, params.context
     rule = resolve_rule(
         context.policy.max_compression_ratio, context.policy.on_violation
     )
@@ -262,10 +249,8 @@ def check_compression_ratio(
         )
 
 
-def check_extension_allowed(
-    info: ZipInfo, target: Path, context: ExtractionContext, state: ValidationState
-) -> Iterable[ExtractViolation]:
-    del state
+def check_extension_allowed(params: ValidatorParams) -> Iterable[ExtractViolation]:
+    info, target, context = params.info, params.target, params.context
     rule = resolve_rule(context.policy.allowed_extensions, context.policy.on_violation)
     suffix = Path(info.filename).suffix.lower()
     if rule.value is not None and suffix not in rule.value:
@@ -278,10 +263,8 @@ def check_extension_allowed(
         )
 
 
-def check_extension_blocked(
-    info: ZipInfo, target: Path, context: ExtractionContext, state: ValidationState
-) -> Iterable[ExtractViolation]:
-    del state
+def check_extension_blocked(params: ValidatorParams) -> Iterable[ExtractViolation]:
+    info, target, context = params.info, params.target, params.context
     rule = resolve_rule(context.policy.blocked_extensions, context.policy.on_violation)
     suffix = Path(info.filename).suffix.lower()
     if rule.value is not None and suffix in rule.value:
@@ -290,10 +273,8 @@ def check_extension_blocked(
         )
 
 
-def check_symlink_allowed(
-    info: ZipInfo, target: Path, context: ExtractionContext, state: ValidationState
-) -> Iterable[ExtractViolation]:
-    del state
+def check_symlink_allowed(params: ValidatorParams) -> Iterable[ExtractViolation]:
+    info, target, context = params.info, params.target, params.context
     rule = resolve_rule(context.policy.allow_symlinks, context.policy.on_violation)
     mode = _entry_mode(info)
     if stat.S_ISLNK(mode) and not rule.value:
@@ -302,10 +283,8 @@ def check_symlink_allowed(
         )
 
 
-def check_special_file_allowed(
-    info: ZipInfo, target: Path, context: ExtractionContext, state: ValidationState
-) -> Iterable[ExtractViolation]:
-    del state
+def check_special_file_allowed(params: ValidatorParams) -> Iterable[ExtractViolation]:
+    info, target, context = params.info, params.target, params.context
     rule = resolve_rule(context.policy.allow_special_files, context.policy.on_violation)
     mode = _entry_mode(info)
     if (
@@ -324,10 +303,8 @@ def check_special_file_allowed(
         )
 
 
-def check_utf8_name(
-    info: ZipInfo, target: Path, context: ExtractionContext, state: ValidationState
-) -> Iterable[ExtractViolation]:
-    del state
+def check_utf8_name(params: ValidatorParams) -> Iterable[ExtractViolation]:
+    info, target, context = params.info, params.target, params.context
     rule = resolve_rule(context.policy.require_utf8_names, context.policy.on_violation)
     if (
         rule.value
@@ -339,11 +316,8 @@ def check_utf8_name(
         )
 
 
-def check_custom_validator(
-    info: ZipInfo, target: Path, context: ExtractionContext, state: ValidationState
-) -> Iterable[ExtractViolation]:
-    del state
-    policy = context.policy
+def check_custom_validator(params: ValidatorParams) -> Iterable[ExtractViolation]:
+    info, target, policy = params.info, params.target, params.context.policy
     if policy.custom_validator is not None:
         try:
             policy.custom_validator(info, target)
@@ -353,9 +327,13 @@ def check_custom_validator(
             )
 
 
-def check_max_entries(
-    info: ZipInfo, target: Path, context: ExtractionContext, state: ValidationState
-) -> Iterable[ExtractViolation]:
+def check_max_entries(params: ValidatorParams) -> Iterable[ExtractViolation]:
+    info, target, context, state = (
+        params.info,
+        params.target,
+        params.context,
+        params.state,
+    )
     rule = resolve_rule(context.policy.max_entries, context.policy.on_violation)
     if rule.value is not None and state.member_index >= rule.value:
         yield _violation(
@@ -368,8 +346,14 @@ def check_max_entries(
 
 
 def check_total_uncompressed_size(
-    info: ZipInfo, target: Path, context: ExtractionContext, state: ValidationState
+    params: ValidatorParams,
 ) -> Iterable[ExtractViolation]:
+    info, target, context, state = (
+        params.info,
+        params.target,
+        params.context,
+        params.state,
+    )
     rule = resolve_rule(
         context.policy.max_total_uncompressed_size, context.policy.on_violation
     )

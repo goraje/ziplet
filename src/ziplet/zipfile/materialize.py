@@ -18,17 +18,26 @@ class MaterializationResult:
     overwritten: bool = False
 
 
+@dataclass(frozen=True)
+class MaterializeParams:
+    """Bundles one materializer call's arguments.
+
+    A materializer only reads the fields it needs — e.g. directory/symlink
+    materialization ignores ``pwd``/quota fields, regular-file
+    materialization ignores ``dir_fd``.
+    """
+
+    member: ZipInfo
+    targetpath: str
+    pwd: bytes | None
+    quota_member_limit: int | None
+    quota_total_limit: int | None
+    quota_total_written: int
+    directory: str
+    dir_fd: int | None
+
+
 class Materializer(Protocol):
     """Protocol for regular-file, directory, and special-file materializers."""
 
-    def __call__(
-        self,
-        member: ZipInfo,
-        targetpath: str,
-        pwd: bytes | None,
-        quota_member_limit: int | None,
-        quota_total_limit: int | None,
-        quota_total_written: int,
-        directory: str,
-        dir_fd: int | None,
-    ) -> MaterializationResult: ...
+    def __call__(self, params: MaterializeParams) -> MaterializationResult: ...
