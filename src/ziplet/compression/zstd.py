@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from importlib import import_module
+from typing import Any, cast
 
 from ziplet.compression.methods import (
     ZIP_ZSTANDARD,
@@ -9,18 +10,22 @@ from ziplet.compression.methods import (
     DecompressorBase,
 )
 
-if TYPE_CHECKING:
-    from compression import (  # ty: ignore[unresolved-import]
-        zstd,  # type: ignore[import-not-found,unused-ignore]
-    )
-else:
-    try:
-        from compression import zstd
-    except ImportError:  # Python < 3.14
+
+def _load_zstd() -> Any:
+    """Return the stdlib ``compression.zstd`` (3.14+), else ``backports.zstd``.
+
+    Loaded dynamically so type checking behaves the same on every Python
+    version and whether or not the optional backport is installed.
+    """
+    for name in ("compression.zstd", "backports.zstd"):
         try:
-            from backports import zstd  # ty: ignore[unresolved-import]
+            return import_module(name)
         except ImportError:
-            zstd = None
+            continue
+    return None
+
+
+zstd = _load_zstd()
 
 compression_entry: CompressionEntry | None = None
 
@@ -51,7 +56,7 @@ if zstd is not None:
             Returns:
                 Compressed bytes. May be empty if data is buffered internally.
             """
-            return self._c.compress(data)
+            return cast(bytes, self._c.compress(data))
 
         def flush(self) -> bytes:
             """Flushes any remaining buffered data and finalizes the stream.
@@ -59,7 +64,7 @@ if zstd is not None:
             Returns:
                 The remaining compressed bytes.
             """
-            return self._c.flush()
+            return cast(bytes, self._c.flush())
 
     class _ZstdDecompressor(DecompressorBase):
         """Wraps zstd.ZstdDecompressor to satisfy DecompressorBase.
@@ -80,11 +85,11 @@ if zstd is not None:
                 True if the decompressor has reached the end of stream,
                 False otherwise.
             """
-            return self._d.eof
+            return cast(bool, self._d.eof)
 
         @property
         def needs_input(self) -> bool:
-            return self._d.needs_input
+            return cast(bool, self._d.needs_input)
 
         def decompress(self, data: bytes, max_length: int = -1) -> bytes:
             """Decompresses a chunk of data.
@@ -95,7 +100,7 @@ if zstd is not None:
             Returns:
                 Decompressed bytes.
             """
-            return self._d.decompress(data, max_length)
+            return cast(bytes, self._d.decompress(data, max_length))
 
     compression_entry = CompressionEntry(
         compression_method=ZIP_ZSTANDARD,
