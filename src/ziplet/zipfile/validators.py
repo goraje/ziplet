@@ -82,6 +82,15 @@ def entry_type(info: ZipInfo) -> tuple[bool, bool]:
     return is_symlink, is_special
 
 
+def has_parent_component(raw_name: str) -> bool:
+    """Return whether *raw_name* contains a ``..`` path component.
+
+    Both ``/`` and ``\\`` count as separators, since archives written on
+    Windows may use either.
+    """
+    return ".." in raw_name.replace("\\", "/").split("/")
+
+
 def _sanitize_windows_name(arcname: str, pathsep: str) -> str:
     """Sanitize *arcname* for extraction on a Windows filesystem.
 
@@ -152,7 +161,7 @@ def check_parent_traversal(params: ValidatorParams) -> Iterable[ExtractViolation
     rule = resolve_rule(
         context.policy.allow_parent_traversal, context.policy.on_violation
     )
-    if ".." in raw.replace("\\", "/").split("/") and not rule.value:
+    if has_parent_component(raw) and not rule.value:
         yield _violation(
             info,
             "parent_traversal",

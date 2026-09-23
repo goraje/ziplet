@@ -26,7 +26,7 @@ from ziplet.zipfile.exceptions import (
 )
 from ziplet.zipfile.info import ZipInfo
 from ziplet.zipfile.secure_fs import open_secure_parent
-from ziplet.zipfile.validators import entry_mode
+from ziplet.zipfile.validators import entry_mode, has_parent_component
 
 __all__ = [
     "ExtractionQuota",
@@ -197,7 +197,7 @@ def materialize_directory(params: MaterializeParams) -> MaterializationResult:
 def materialize_symlink(params: MaterializeParams) -> MaterializationResult:
     with params.open_member() as source:
         link_target = os.fsdecode(source.read())
-    if os.path.isabs(link_target) or ".." in link_target.replace("\\", "/").split("/"):
+    if os.path.isabs(link_target) or has_parent_component(link_target):
         raise ExtractionSecurityError(
             "Refusing to create symlink outside extraction root"
         )

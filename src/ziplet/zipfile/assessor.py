@@ -106,15 +106,17 @@ def assess_archive(
     members: list[MemberAssessment] = []
     violations: list[ExtractViolation] = []
     duplicate_targets: list[Path] = []
+    seen_targets: set[Path] = set()
     for info in infos:
         state.names[info.filename] = state.names.get(info.filename, 0) + 1
         state.total_declared += info.file_size
         state.total_compressed += info.compress_size
-        seen_targets = set(state.targets)
         assessment = assess_member(info, destination, root, policy, state)
         state.member_index += 1
-        if assessment.target is not None and assessment.target in seen_targets:
-            duplicate_targets.append(assessment.target)
+        if assessment.target is not None:
+            if assessment.target in seen_targets:
+                duplicate_targets.append(assessment.target)
+            seen_targets.add(assessment.target)
         members.append(assessment)
         violations.extend(assessment.violations)
     return ArchiveAssessment(

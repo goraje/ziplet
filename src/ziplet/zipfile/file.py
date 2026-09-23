@@ -727,54 +727,54 @@ class ZipFile:
                 "the ZIP file."
             )
         reservation = self._write_coordinator.reserve()
-
-        zinfo.compress_size = 0
-        zinfo.CRC = 0
-
-        zinfo.flag_bits = 0x00
-        if zinfo.compress_type == ZIP_LZMA:
-            zinfo.flag_bits |= MASK_COMPRESS_OPTION_1
-        if not self._seekable:
-            zinfo.flag_bits |= MASK_USE_DATA_DESCRIPTOR
-
-        if not zinfo.external_attr:
-            zinfo.external_attr = 0o600 << 16
-
-        zip64 = force_zip64 or (zinfo.file_size + zinfo.file_size // 20 > ZIP64_LIMIT)
-        if not self._allow_zip64 and zip64:
-            raise LargeZipFile("Filesize would require ZIP64 extensions")
-
-        assert self.fp is not None
-        if self._seekable:
-            self.fp.seek(self.start_dir)
-        zinfo.header_offset = self.fp.tell()
-
-        self._check_writable(zinfo)
-        self._mark_modified()
-
-        effective_encryption = (
-            self.encryption if encryption is INHERIT_ENCRYPTION else encryption
-        )
-        if effective_encryption is None and password is not None:
-            raise ValueError("password cannot be used for an unencrypted entry")
-        encryptor = None
-        if effective_encryption:
-            zinfo.flag_bits |= MASK_ENCRYPTED
-            encryptor = self.get_encryptor(
-                cast(str, effective_encryption),
-                password,
-                nbits=extra.wz_aes_nbits if extra else None,
-                force_wz_aes_version=extra.force_wz_aes_version if extra else None,
-            )
-
         try:
-            writer = ZipWriteFile(
+            zinfo.compress_size = 0
+            zinfo.CRC = 0
+
+            zinfo.flag_bits = 0x00
+            if zinfo.compress_type == ZIP_LZMA:
+                zinfo.flag_bits |= MASK_COMPRESS_OPTION_1
+            if not self._seekable:
+                zinfo.flag_bits |= MASK_USE_DATA_DESCRIPTOR
+
+            if not zinfo.external_attr:
+                zinfo.external_attr = 0o600 << 16
+
+            zip64 = force_zip64 or (
+                zinfo.file_size + zinfo.file_size // 20 > ZIP64_LIMIT
+            )
+            if not self._allow_zip64 and zip64:
+                raise LargeZipFile("Filesize would require ZIP64 extensions")
+
+            assert self.fp is not None
+            if self._seekable:
+                self.fp.seek(self.start_dir)
+            zinfo.header_offset = self.fp.tell()
+
+            self._check_writable(zinfo)
+            self._mark_modified()
+
+            effective_encryption = (
+                self.encryption if encryption is INHERIT_ENCRYPTION else encryption
+            )
+            if effective_encryption is None and password is not None:
+                raise ValueError("password cannot be used for an unencrypted entry")
+            encryptor = None
+            if effective_encryption:
+                zinfo.flag_bits |= MASK_ENCRYPTED
+                encryptor = self.get_encryptor(
+                    cast(str, effective_encryption),
+                    password,
+                    nbits=extra.wz_aes_nbits if extra else None,
+                    force_wz_aes_version=extra.force_wz_aes_version if extra else None,
+                )
+
+            return ZipWriteFile(
                 self, zinfo, zip64, encryptor, self._compression_registry, reservation
             )
         except BaseException:
             self._write_coordinator.release(reservation)
             raise
-        return writer
 
     @overload
     def extract(

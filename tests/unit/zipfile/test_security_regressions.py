@@ -10,7 +10,7 @@ import pytest
 
 import ziplet
 from ziplet.compression import lzma, registry
-from ziplet.exceptions import BadZipFile
+from ziplet.exceptions import BadZipFile, LargeZipFile
 from ziplet.zipfile.exceptions import ExtractionMaterializationError
 from ziplet.zipfile.ext import ZipExtFile
 from ziplet.zipfile.file import ZipFileExtra
@@ -340,3 +340,58 @@ def test_extract_into_destination_reached_through_symlink(
         else:
             zf.extractall(link)
     assert (real / "dir" / "file.txt").read_bytes() == b"data"
+
+
+def _open_failure_password_without_encryption(zf: ziplet.ZipFile) -> None:
+    zf.open("bad.txt", "w", password=b"secret")
+
+
+def _open_failure_missing_password(zf: ziplet.ZipFile) -> None:
+    zf.open("bad.txt", "w", encryption=ziplet.WZ_AES)
+
+
+def _open_failure_zip64_required(zf: ziplet.ZipFile) -> None:
+    info = ZipInfo("huge.bin")
+    info.file_size = 1 << 32
+    zf.open(info, "w")
+
+
+@pytest.mark.parametrize(
+    ("failing_open", "error"),
+    [
+        (_open_failure_password_without_encryption, ValueError),
+        (_open_failure_missing_password, RuntimeError),
+        (_open_failure_zip64_required, LargeZipFile),
+    ],
+)
+def test_failed_open_for_write_does_not_lock_the_archive(
+    failing_open: Any, error: type[Exception]
+) -> None:
+    buffer = io.BytesIO()
+    with ziplet.ZipFile(buffer, "w", allowZip64=False) as zf:
+        zf.writestr("before.txt", b"before")
+        with pytest.raises(error):
+            failing_open(zf)
+        zf.writestr("after.txt", b"after")
+
+    with ziplet.ZipFile(io.BytesIO(buffer.getvalue())) as zf:
+        assert zf.namelist() == ["before.txt", "after.txt"]
+        assert zf.read("after.txt") == b"after"
+
+
+def _write_duplicates(archive: Any) -> None:
+    with ziplet.ZipFile(archive, "w") as zf:
+        for _ in range(3):
+            zf.writestr("same.txt", b"x")
+        zf.writestr("other.txt", b"y")
+
+
+def test_assess_reports_each_duplicate_target_once(tmp_path: Any) -> None:
+    archive = tmp_path / "dups.zip"
+    with pytest.warns(UserWarning, match="Duplicate name"):
+        _write_duplicates(archive)
+
+    with ziplet.ZipFile(archive) as zf:
+        assessment = zf.assess(tmp_path / "out")
+    assert assessment.duplicate_member_names == ("same.txt",)
+    assert assessment.duplicate_targets == ((tmp_path / "out" / "same.txt").resolve(),)
