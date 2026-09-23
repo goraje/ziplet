@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import os
+import stat
 import struct
 from typing import Any, cast
 
@@ -9,16 +11,17 @@ import pytest
 import ziplet
 from ziplet.compression import lzma, registry
 from ziplet.exceptions import BadZipFile
+from ziplet.zipfile.exceptions import ExtractionMaterializationError
 from ziplet.zipfile.ext import ZipExtFile
 from ziplet.zipfile.file import ZipFileExtra
 from ziplet.zipfile.info import ZipInfo
 from ziplet.zipfile.shared import (
-    sizeCentralDir,
-    sizeFileHeader,
-    stringCentralDir,
-    stringFileHeader,
-    structCentralDir,
-    structFileHeader,
+    CENTRAL_DIR_SIGNATURE,
+    CENTRAL_DIR_SIZE,
+    CENTRAL_DIR_STRUCT,
+    FILE_HEADER_SIGNATURE,
+    FILE_HEADER_SIZE,
+    FILE_HEADER_STRUCT,
 )
 
 
@@ -70,7 +73,7 @@ def test_aes_defaults_to_version_two_and_zero_crc() -> None:
     info.file_size = 1024
     info.compress_type = 8
 
-    extra, crc, _ = info.encode_extra(0x12345678, info.compress_type)
+    extra, crc, _ = info._encode_extra(0x12345678, info.compress_type)
 
     _, _, version = struct.unpack("<HHH", extra[:6])
     assert version == 2
@@ -78,22 +81,22 @@ def test_aes_defaults_to_version_two_and_zero_crc() -> None:
 
 
 def _find_aes_metadata(archive: bytes) -> tuple[int, int, int, int]:
-    local_offset = archive.index(stringFileHeader)
+    local_offset = archive.index(FILE_HEADER_SIGNATURE)
     local = struct.unpack(
-        structFileHeader,
-        archive[local_offset : local_offset + sizeFileHeader],
+        FILE_HEADER_STRUCT,
+        archive[local_offset : local_offset + FILE_HEADER_SIZE],
     )
     local_name_len, local_extra_len = local[10:12]
-    local_extra_start = local_offset + sizeFileHeader + local_name_len
+    local_extra_start = local_offset + FILE_HEADER_SIZE + local_name_len
     local_extra = archive[local_extra_start : local_extra_start + local_extra_len]
 
-    central_offset = archive.index(stringCentralDir)
+    central_offset = archive.index(CENTRAL_DIR_SIGNATURE)
     central = struct.unpack(
-        structCentralDir,
-        archive[central_offset : central_offset + sizeCentralDir],
+        CENTRAL_DIR_STRUCT,
+        archive[central_offset : central_offset + CENTRAL_DIR_SIZE],
     )
     central_name_len, central_extra_len = central[12:14]
-    central_extra_start = central_offset + sizeCentralDir + central_name_len
+    central_extra_start = central_offset + CENTRAL_DIR_SIZE + central_name_len
     central_extra = archive[
         central_extra_start : central_extra_start + central_extra_len
     ]
@@ -172,7 +175,7 @@ def test_crc_mismatch_is_detected(tmp_path: Any) -> None:
     with ziplet.ZipFile(path, "w") as zf:
         zf.writestr("payload.bin", b"payload")
     archive = bytearray(path.read_bytes())
-    central_offset = archive.index(stringCentralDir)
+    central_offset = archive.index(CENTRAL_DIR_SIGNATURE)
     archive[central_offset + 16 : central_offset + 20] = struct.pack("<L", 0)
     path.write_bytes(archive)
 
@@ -239,3 +242,101 @@ def test_aes_output_works_on_non_seekable_stream() -> None:
     with ziplet.ZipFile(io.BytesIO(buffer.getvalue())) as zf:
         zf.setpassword(b"password")
         assert zf.read("payload.bin") == b"payload"
+
+
+def test_aes_v2_data_descriptor_zeroes_crc() -> None:
+    buffer = _NonSeekableBytesIO()
+    with ziplet.ZipFile(buffer, "w", encryption=ziplet.WZ_AES) as zf:
+        zf.setpassword(b"password")
+        zf.writestr("payload.bin", b"payload")
+
+    data = buffer.getvalue()
+    offset = data.index(b"PK\x07\x08")
+    _, crc, _, _ = struct.unpack_from("<LLLL", data, offset)
+    assert crc == 0
+
+
+def _symlink_archive(path: Any, name: str, target: str) -> None:
+    info = ZipInfo(name)
+    info.external_attr = (stat.S_IFLNK | 0o777) << 16
+    with ziplet.ZipFile(path, "w") as zf:
+        zf.writestr(info, target)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symlinks")
+def test_symlink_member_over_existing_directory_raises_extraction_error(
+    tmp_path: Any,
+) -> None:
+    archive = tmp_path / "link.zip"
+    _symlink_archive(archive, "victim", "elsewhere")
+    dest = tmp_path / "dest"
+    (dest / "victim").mkdir(parents=True)
+
+    with ziplet.ZipFile(archive) as zf:
+        with pytest.raises(ExtractionMaterializationError):
+            zf.extractall(dest)
+    assert (dest / "victim").is_dir()
+
+
+def test_file_member_over_existing_directory_raises_extraction_error(
+    tmp_path: Any,
+) -> None:
+    archive = tmp_path / "file.zip"
+    with ziplet.ZipFile(archive, "w") as zf:
+        zf.writestr("victim", b"data")
+    dest = tmp_path / "dest"
+    (dest / "victim").mkdir(parents=True)
+
+    with ziplet.ZipFile(archive) as zf:
+        with pytest.raises(ExtractionMaterializationError):
+            zf.extractall(dest)
+    assert (dest / "victim").is_dir()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symlinks")
+def test_extract_refuses_symlinked_intermediate_directory(tmp_path: Any) -> None:
+    archive = tmp_path / "nested.zip"
+    with ziplet.ZipFile(archive, "w") as zf:
+        zf.writestr("sub/inner.txt", b"data")
+    dest = tmp_path / "dest"
+    outside = tmp_path / "outside"
+    dest.mkdir()
+    outside.mkdir()
+    (dest / "sub").symlink_to(outside, target_is_directory=True)
+
+    with ziplet.ZipFile(archive) as zf:
+        with pytest.raises(ValueError, match="unsafe extraction path"):
+            zf.extractall(dest)
+    assert list(outside.iterdir()) == []
+
+
+def test_extract_creates_nested_parents(tmp_path: Any) -> None:
+    archive = tmp_path / "deep.zip"
+    with ziplet.ZipFile(archive, "w") as zf:
+        zf.writestr("a/b/c.txt", b"data")
+    dest = tmp_path / "dest"
+
+    with ziplet.ZipFile(archive) as zf:
+        zf.extractall(dest)
+    assert (dest / "a" / "b" / "c.txt").read_bytes() == b"data"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="symlinks")
+@pytest.mark.parametrize("use_policy", [False, True])
+def test_extract_into_destination_reached_through_symlink(
+    tmp_path: Any, use_policy: bool
+) -> None:
+    archive = tmp_path / "a.zip"
+    with ziplet.ZipFile(archive, "w") as zf:
+        zf.writestr("dir/file.txt", b"data")
+    real = tmp_path / "real"
+    real.mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(real, target_is_directory=True)
+
+    with ziplet.ZipFile(archive) as zf:
+        if use_policy:
+            zf.extractall(link, policy=ziplet.ExtractPolicy())
+        else:
+            zf.extractall(link)
+    assert (real / "dir" / "file.txt").read_bytes() == b"data"

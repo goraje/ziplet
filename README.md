@@ -325,6 +325,9 @@ the partial `ExtractResult` in its `result` attribute.
 Regular files are written to a temporary file in the destination directory and
 atomically committed only after the member has been fully read and quota checks
 have succeeded. Existing files are therefore preserved when a member fails.
+Each file is fsynced before it is moved into place; pass
+`ExtractPolicy(fsync_files=False)` to skip that when extraction throughput matters
+more than durability across power loss.
 Symlinks and special files are rejected by default. Allowed symlinks are
 materialized without following their targets, and supported FIFOs can be
 materialized on platforms that provide `os.mkfifo`. Descriptor-backed
@@ -359,7 +362,13 @@ compatibility with code using the CPython-style metadata attribute.
 
 ## Notes
 
-- `ZIP_ZSTANDARD` compression requires a Python runtime that provides zstandard support
+- `ZIP_ZSTANDARD` compression uses stdlib `compression.zstd` (Python 3.14+); on
+  Python 3.10-3.13 install the optional extra (`pip install "ziplet[zstd]"`,
+  which pulls in `backports.zstd`), otherwise using it raises `RuntimeError`
+- ZIP archives that span multiple disks are not supported (same as the standard
+  library) and are rejected with `BadZipFile`
+- only one write handle may be open per archive at a time; opening a second
+  one, or reading while a writer is active, raises `ValueError`
 - use WinZip AES for modern encrypted ZIP workflows (ZipCrypto is mainly for compatibility with older tools)
 - passwords must be byte strings
 - decompression is streamed and bounded per read, but callers should still

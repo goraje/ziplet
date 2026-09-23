@@ -14,22 +14,19 @@ from __future__ import annotations
 import contextlib
 import io
 import itertools
-import os
 import pathlib
 import posixpath
 import re
 import stat
 from collections.abc import Iterable, Iterator
-from typing import IO, Any, Literal, TypeAlias, cast
+from typing import IO, Any, cast
 
 from ziplet.zipfile.file import ZipFile
 from ziplet.zipfile.info import ZipInfo
 from ziplet.zipfile.path.glob import Translator
+from ziplet.zipfile.shared import ReadWriteMode, StrPath
 
 __all__ = ["Path"]
-
-_StrPath: TypeAlias = str | os.PathLike[str]
-_ReadWriteMode: TypeAlias = Literal["r", "w"]
 
 
 def _parents(path: str) -> Iterator[str]:
@@ -133,7 +130,7 @@ class CompleteDirs(ZipFile):
             return ZipInfo(filename=name)
 
     @classmethod
-    def make(cls, source: ZipFile | _StrPath) -> CompleteDirs:
+    def make(cls, source: ZipFile | StrPath) -> CompleteDirs:
         """Return a :class:`CompleteDirs`-compatible wrapper around *source*.
 
         If *source* is already a :class:`CompleteDirs`, it is returned
@@ -271,7 +268,7 @@ class Path:
     root: CompleteDirs
     at: str
 
-    def __init__(self, root: ZipFile | _StrPath, at: str = "") -> None:
+    def __init__(self, root: ZipFile | StrPath, at: str = "") -> None:
         """Construct a :class:`Path` from a :class:`ZipFile` or filename.
 
         Note: when *root* is an existing :class:`~ziplet.zipfile.file.ZipFile`
@@ -326,7 +323,7 @@ class Path:
         """
         if self.is_dir():
             raise IsADirectoryError(self)
-        zip_mode = cast(_ReadWriteMode, mode[0])
+        zip_mode = cast(ReadWriteMode, mode[0])
         if zip_mode == "r" and not self.exists():
             raise FileNotFoundError(self)
         stream = self.root.open(self.at, zip_mode, pwd)

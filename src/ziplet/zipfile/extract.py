@@ -107,6 +107,7 @@ class ExtractPolicy:
     reject_duplicate_targets: bool | ExtractPolicyRule[bool] = True
     on_violation: ViolationAction = ViolationAction.ERROR
     preview_only: bool = False
+    fsync_files: bool = True
     custom_validator: Callable[["ZipInfo", Path], None] | None = None
 
 
@@ -174,3 +175,8 @@ class ExtractionError(Exception):
 
 def normalized_destination(path: str | os.PathLike[str]) -> Path:
     return Path(os.path.abspath(os.fspath(path)))
+
+
+def compression_ratio(info: ZipInfo) -> float | None:
+    """Return uncompressed/compressed size, or ``None`` for empty payloads."""
+    return None if info.compress_size == 0 else info.file_size / info.compress_size

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -33,14 +32,26 @@ class _FakeEncryptor:
         return self._flush_tail
 
 
-def _make_parent() -> SimpleNamespace:
-    return SimpleNamespace(
-        fp=io.BytesIO(),
-        _didModify=False,
-        start_dir=0,
-        filelist=[],
-        NameToInfo={},
-    )
+class _FakeArchive:
+    """The slice of ``ZipFile`` that ``ZipWriteFile`` collaborates with."""
+
+    def __init__(self) -> None:
+        self.fp = io.BytesIO()
+        self.start_dir = 0
+        self.filelist: list[ZipInfo] = []
+        self.NameToInfo: dict[str, ZipInfo] = {}
+        self.modified = False
+
+    def _mark_modified(self) -> None:
+        self.modified = True
+
+    def _add_entry(self, zinfo: ZipInfo) -> None:
+        self.filelist.append(zinfo)
+        self.NameToInfo[zinfo.filename] = zinfo
+
+
+def _make_parent() -> _FakeArchive:
+    return _FakeArchive()
 
 
 def _make_zinfo(name: str) -> ZipInfo:

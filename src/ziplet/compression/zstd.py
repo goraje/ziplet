@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import sys
+from typing import TYPE_CHECKING
 
 from ziplet.compression.methods import (
     ZIP_ZSTANDARD,
@@ -9,87 +9,96 @@ from ziplet.compression.methods import (
     DecompressorBase,
 )
 
-if sys.version_info >= (3, 14):
+if TYPE_CHECKING:
+    from compression import (  # ty: ignore[unresolved-import]
+        zstd,  # type: ignore[import-not-found,unused-ignore]
+    )
+else:
     try:
         from compression import zstd
+    except ImportError:  # Python < 3.14
+        try:
+            from backports import zstd  # ty: ignore[unresolved-import]
+        except ImportError:
+            zstd = None
 
-        class _ZstdCompressor(CompressorBase):
-            """Wraps zstd.ZstdCompressor to satisfy CompressorBase.
+compression_entry: CompressionEntry | None = None
 
-            Attributes:
-                _c: The underlying zstd.ZstdCompressor instance.
+if zstd is not None:
+
+    class _ZstdCompressor(CompressorBase):
+        """Wraps zstd.ZstdCompressor to satisfy CompressorBase.
+
+        Attributes:
+            _c: The underlying zstd.ZstdCompressor instance.
+        """
+
+        def __init__(self, level: int | None) -> None:
+            """Initializes the compressor with an optional compression level.
+
+            Args:
+                level: The Zstandard compression level. If None, the default
+                    compression level is used.
             """
+            self._c = zstd.ZstdCompressor(level=level)
 
-            def __init__(self, level: int | None) -> None:
-                """Initializes the compressor with an optional compression level.
+        def compress(self, data: bytes) -> bytes:
+            """Compresses a chunk of data.
 
-                Args:
-                    level: The Zstandard compression level. If None, the default
-                        compression level is used.
-                """
-                self._c = zstd.ZstdCompressor(level=level)
+            Args:
+                data: The raw bytes to compress.
 
-            def compress(self, data: bytes) -> bytes:
-                """Compresses a chunk of data.
-
-                Args:
-                    data: The raw bytes to compress.
-
-                Returns:
-                    Compressed bytes. May be empty if data is buffered internally.
-                """
-                return self._c.compress(data)
-
-            def flush(self) -> bytes:
-                """Flushes any remaining buffered data and finalizes the stream.
-
-                Returns:
-                    The remaining compressed bytes.
-                """
-                return self._c.flush()
-
-        class _ZstdDecompressor(DecompressorBase):
-            """Wraps zstd.ZstdDecompressor to satisfy DecompressorBase.
-
-            Attributes:
-                _d: The underlying zstd.ZstdDecompressor instance.
+            Returns:
+                Compressed bytes. May be empty if data is buffered internally.
             """
+            return self._c.compress(data)
 
-            def __init__(self) -> None:
-                """Initializes the decompressor."""
-                self._d = zstd.ZstdDecompressor()
+        def flush(self) -> bytes:
+            """Flushes any remaining buffered data and finalizes the stream.
 
-            @property
-            def eof(self) -> bool:
-                """Whether the end of the compressed stream has been reached.
+            Returns:
+                The remaining compressed bytes.
+            """
+            return self._c.flush()
 
-                Returns:
-                    True if the decompressor has reached the end of stream,
-                    False otherwise.
-                """
-                return self._d.eof
+    class _ZstdDecompressor(DecompressorBase):
+        """Wraps zstd.ZstdDecompressor to satisfy DecompressorBase.
 
-            @property
-            def needs_input(self) -> bool:
-                return self._d.needs_input
+        Attributes:
+            _d: The underlying zstd.ZstdDecompressor instance.
+        """
 
-            def decompress(self, data: bytes, max_length: int = -1) -> bytes:
-                """Decompresses a chunk of data.
+        def __init__(self) -> None:
+            """Initializes the decompressor."""
+            self._d = zstd.ZstdDecompressor()
 
-                Args:
-                    data: The compressed bytes to decompress.
+        @property
+        def eof(self) -> bool:
+            """Whether the end of the compressed stream has been reached.
 
-                Returns:
-                    Decompressed bytes.
-                """
-                return self._d.decompress(data, max_length)
+            Returns:
+                True if the decompressor has reached the end of stream,
+                False otherwise.
+            """
+            return self._d.eof
 
-        compression_entry: CompressionEntry | None = CompressionEntry(
-            compression_method=ZIP_ZSTANDARD,
-            compressor_factory=_ZstdCompressor,
-            decompressor_factory=_ZstdDecompressor,
-        )
-    except ImportError:
-        compression_entry = None
-else:
-    compression_entry = None
+        @property
+        def needs_input(self) -> bool:
+            return self._d.needs_input
+
+        def decompress(self, data: bytes, max_length: int = -1) -> bytes:
+            """Decompresses a chunk of data.
+
+            Args:
+                data: The compressed bytes to decompress.
+
+            Returns:
+                Decompressed bytes.
+            """
+            return self._d.decompress(data, max_length)
+
+    compression_entry = CompressionEntry(
+        compression_method=ZIP_ZSTANDARD,
+        compressor_factory=_ZstdCompressor,
+        decompressor_factory=_ZstdDecompressor,
+    )

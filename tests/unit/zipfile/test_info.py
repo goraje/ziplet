@@ -259,7 +259,7 @@ class TestZipInfoDecodeExtraWzAes:
         zi = ZipInfo()
         raw = self._make_wz_aes_extra(version=1, strength=3, compress_type=8)
         zi.extra = raw
-        zi._decodeExtra(0)
+        zi._decode_extra(0)
         assert zi.aes_extra.wz_aes_version == 1
         assert zi.aes_extra.wz_aes_vendor_id == b"AE"
         assert zi.aes_extra.wz_aes_strength == 3
@@ -271,10 +271,10 @@ class TestZipInfoDecodeExtraWzAes:
         raw = struct.pack("<HH", 0x9901, 5) + body
         zi.extra = raw
         with pytest.raises(BadZipFile):
-            zi._decodeExtra(0)
+            zi._decode_extra(0)
 
     def test_unknown_extra_tag_silently_ignored(self) -> None:
         zi = ZipInfo()
         body = b"\x00" * 4
         zi.extra = struct.pack("<HH", 0xBEEF, 4) + body
-        zi._decodeExtra(0)  # should not raise
+        zi._decode_extra(0)  # should not raise

@@ -69,7 +69,7 @@ class Registry:
         ZIP_DEFLATED: "zlib",
         ZIP_BZIP2: "bz2",
         ZIP_LZMA: "lzma",
-        ZIP_ZSTANDARD: "compression.zstd",
+        ZIP_ZSTANDARD: "compression.zstd (or backports.zstd)",
     }
 
     def __init__(self) -> None:

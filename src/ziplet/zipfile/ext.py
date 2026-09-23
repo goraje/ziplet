@@ -1,20 +1,9 @@
 from __future__ import annotations
 
-import binascii
 import io
 import os
-
-try:
-    import zlib
-
-    crc32 = zlib.crc32
-except ImportError:
-    crc32 = binascii.crc32
-
 from collections.abc import Callable
-from typing import Any, Literal
-
-from typing_extensions import TypeAlias
+from typing import Any
 
 from ziplet.compression import (
     ZIP_DEFLATED,
@@ -33,12 +22,12 @@ from ziplet.cryptography.zipcrypto import ZipCryptoDecrypter
 from ziplet.exceptions import BadZipFile
 from ziplet.zipfile.info import ZipInfo
 from ziplet.zipfile.io_wrappers import ClosableZipStream
+from ziplet.zipfile.records import raise_for_unsupported_flags
+from ziplet.zipfile.shared import ReadWriteMode, crc32
 
 __all__ = [
     "ZipExtFile",
 ]
-
-_ReadWriteMode: TypeAlias = Literal["r", "w"]
 
 
 class ZipExtFile(io.BufferedIOBase):
@@ -55,7 +44,7 @@ class ZipExtFile(io.BufferedIOBase):
         MIN_READ_SIZE (int): Minimum read from the underlying stream (4 KiB).
         MAX_SEEK_READ (int): Maximum bytes consumed per seek-forward step (16 MiB).
         encryption_header (bytes): Raw encryption header read from the stream.
-            Set by :meth:`setup_decrypter`; only present on encrypted entries.
+            Set by :meth:`_setup_decrypter`; only present on encrypted entries.
         mode (str): Opening mode, always ``'r'``.
         name (str): Filename of the ZIP entry.
         newlines (None): Unused compatibility attribute for the ``io`` layer.
@@ -74,13 +63,13 @@ class ZipExtFile(io.BufferedIOBase):
     # Chunk size to read during seek
     MAX_SEEK_READ: int = 1 << 24
 
-    # Set by setup_decrypter before get_decrypter_kwargs
+    # Set by _setup_decrypter before _decrypter_kwargs
     encryption_header: bytes
 
     def __init__(
         self,
         fileobj: ClosableZipStream,
-        mode: _ReadWriteMode,
+        mode: ReadWriteMode,
         zipinfo: ZipInfo,
         close_fileobj: bool = False,
         pwd: bytes | None = None,
@@ -113,8 +102,7 @@ class ZipExtFile(io.BufferedIOBase):
         self._pwd = pwd
         self._compression_registry = compression_registry
 
-        self.process_local_header()
-        self.raise_for_unsupported_flags()
+        raise_for_unsupported_flags(zipinfo)
 
         self._compress_type = zipinfo.compress_type
         self._orig_compress_left = zipinfo.compress_size
@@ -141,49 +129,16 @@ class ZipExtFile(io.BufferedIOBase):
 
         self._decrypter_cls: Callable[..., ZipCryptoDecrypter | AesZipDecrypter] | None
         if self._zinfo.is_encrypted:
-            self._decrypter_cls = self.setup_decrypter()
+            self._decrypter_cls = self._setup_decrypter()
         else:
             self._decrypter_cls = None
 
         # _compress_start is the file position after any encryption header.
         # Used for seek-backwards resets.
         self._compress_start: int = fileobj.tell()
-        self.read_init()
+        self._init_read_state()
 
-    def process_local_header(self) -> None:
-        """Hook called at the start of ``__init__``.
-
-        The base implementation is a no-op: ``ZipFile.open()`` has already
-        read and validated the local file header before creating this object.
-        Subclasses may override to perform additional setup.
-        """
-
-    def raise_for_unsupported_flags(self) -> None:
-        """Raise :exc:`NotImplementedError` for unsupported flag combinations.
-
-        Raises:
-            NotImplementedError: If the entry uses compressed-patch data
-                (flag bit 5) or strong encryption (flag bit 6).
-        """
-        if self._zinfo.is_compressed_patch_data:
-            raise NotImplementedError("compressed patched data (flag bit 5)")
-        if self._zinfo.is_strong_encryption:
-            raise NotImplementedError("strong encryption (flag bit 6)")
-
-    def get_decompressor(self, compress_type: int) -> DecompressorBase:
-        """Return a fresh decompressor instance for *compress_type*.
-
-        Args:
-            compress_type (int): ZIP compression method identifier
-                (e.g. ``ZIP_DEFLATED``, ``ZIP_STORED``).
-
-        Returns:
-            DecompressorBase | None: A new decompressor, or ``None`` if no
-            decompressor is registered for *compress_type*.
-        """
-        return self._compression_registry.get_decompressor(compress_type)
-
-    def setup_decrypter(self) -> type[ZipCryptoDecrypter] | type[AesZipDecrypter]:
+    def _setup_decrypter(self) -> type[ZipCryptoDecrypter] | type[AesZipDecrypter]:
         """Read the encryption header and return the appropriate decrypter class.
 
         Reads the encryption header bytes from the stream, stores them in
@@ -241,7 +196,7 @@ class ZipExtFile(io.BufferedIOBase):
             return AesZipDecrypter
         return ZipCryptoDecrypter
 
-    def get_decrypter_kwargs(self) -> dict[str, Any]:
+    def _decrypter_kwargs(self) -> dict[str, Any]:
         """Return keyword arguments for the decrypter constructor.
 
         Returns:
@@ -253,7 +208,7 @@ class ZipExtFile(io.BufferedIOBase):
             "encryption_header": self.encryption_header,
         }
 
-    def get_decrypter(self) -> ZipCryptoDecrypter | AesZipDecrypter | None:
+    def _get_decrypter(self) -> ZipCryptoDecrypter | AesZipDecrypter | None:
         """Instantiate and return the decrypter for this entry.
 
         Returns:
@@ -266,10 +221,10 @@ class ZipExtFile(io.BufferedIOBase):
                 fails (wrong password).
         """
         if self._decrypter_cls is not None:
-            return self._decrypter_cls(self._zinfo, **self.get_decrypter_kwargs())
+            return self._decrypter_cls(self._zinfo, **self._decrypter_kwargs())
         return None
 
-    def read_init(self) -> None:
+    def _init_read_state(self) -> None:
         """(Re-)initialise all reading state.
 
         Called at construction time and whenever a backwards seek resets the
@@ -284,13 +239,13 @@ class ZipExtFile(io.BufferedIOBase):
         self._offset: int = 0
         self._eof: bool = False
         self._decrypter: ZipCryptoDecrypter | AesZipDecrypter | None = (
-            self.get_decrypter()
+            self._get_decrypter()
         )
-        self._decompressor: DecompressorBase = self.get_decompressor(
-            self._compress_type
+        self._decompressor: DecompressorBase = (
+            self._compression_registry.get_decompressor(self._compress_type)
         )
 
-    def check_integrity(self) -> None:
+    def _check_integrity(self) -> None:
         """Verify the integrity of a fully-read entry.
 
         Called automatically by :meth:`_read1` once EOF is reached.
@@ -528,7 +483,7 @@ class ZipExtFile(io.BufferedIOBase):
 
         Reads raw compressed bytes via :meth:`_read2`, optionally decrypts
         them, decompresses them according to :attr:`_compress_type`, updates
-        the running CRC, and calls :meth:`check_integrity` once EOF is
+        the running CRC, and calls :meth:`_check_integrity` once EOF is
         detected.
 
         Args:
@@ -595,7 +550,7 @@ class ZipExtFile(io.BufferedIOBase):
             raise BadZipFile(f"Truncated compressed stream for '{self.name}'")
         self._update_crc(data)
         if self._eof:
-            self.check_integrity()
+            self._check_integrity()
         return data
 
     def _read2(self, n: int) -> bytes:
@@ -732,7 +687,7 @@ class ZipExtFile(io.BufferedIOBase):
         elif read_offset < 0:
             # Position is before the current position. Reset state.
             self._fileobj.seek(self._compress_start)
-            self.read_init()
+            self._init_read_state()
             read_offset = new_pos
 
         while read_offset > 0:

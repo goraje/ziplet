@@ -70,8 +70,7 @@ def test_round_trip(
 
 
 def test_zip64_eocd_round_trip(tmp_path: Path) -> None:
-    """Exercise _EndRecData64: create a ZIP64 archive using stdlib (forced via patched
-    ZIP64_LIMIT) and verify ziplet can read it correctly."""
+    """Create a ZIP64 archive with stdlib (via patched ZIP64_LIMIT) and read it."""
     path = tmp_path / "zip64.zip"
     with mock.patch.object(_stdlib_zipfile, "ZIP64_LIMIT", -1):
         with _stdlib_zipfile.ZipFile(path, "w", allowZip64=True) as zf:

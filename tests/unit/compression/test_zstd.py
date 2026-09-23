@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import sys
-
 import pytest
 
 from ziplet.compression import zstd
@@ -13,8 +11,8 @@ from ziplet.compression.methods import (
 )
 
 pytestmark = pytest.mark.skipif(
-    sys.version_info < (3, 14) or zstd.compression_entry is None,
-    reason="zstandard tests require Python >= 3.14 and compression.zstd availability",
+    zstd.compression_entry is None,
+    reason="zstandard tests require compression.zstd or backports.zstd",
 )
 
 SAMPLE_DATA = b"Hello, Zstandard world! " * 100

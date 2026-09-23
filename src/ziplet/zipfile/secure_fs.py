@@ -8,6 +8,7 @@ provided by Python.
 
 from __future__ import annotations
 
+import errno
 import os
 from pathlib import Path
 
@@ -21,7 +22,12 @@ class SecureExtractionRoot:
 
     @property
     def descriptor_supported(self) -> bool:
-        return os.name == "posix" and hasattr(os, "O_NOFOLLOW")
+        return (
+            os.name == "posix"
+            and hasattr(os, "O_NOFOLLOW")
+            and os.mkdir in os.supports_dir_fd
+            and os.open in os.supports_dir_fd
+        )
 
     def __enter__(self) -> SecureExtractionRoot:
         self.path.mkdir(parents=True, exist_ok=True)
@@ -36,26 +42,85 @@ class SecureExtractionRoot:
             os.close(self._descriptor)
             self._descriptor = None
 
-    def ensure_parents(self, relative_parts: tuple[str, ...]) -> Path:
-        """Create and validate parent directories for a relative member path."""
-        current = self.path
-        for part in relative_parts:
-            current /= part
-            if current.is_symlink():
-                raise ValueError("Refusing to traverse unsafe extraction path")
-            if current.exists() and not current.is_dir():
-                raise ValueError("Refusing to traverse unsafe extraction path")
-            current.mkdir(exist_ok=True)
-        return current
+    def ensure_parents(self, relative_parts: tuple[str, ...]) -> int | None:
+        """Create and validate parent directories for a relative member path.
 
-    def open_leaf_parent(self, parent: Path) -> int | None:
-        """Open a NOFOLLOW dir_fd for *parent*, already validated by
-        :meth:`ensure_parents`, so a caller can perform a ``dir_fd``-relative
-        leaf write without a TOCTOU window between validation and the write.
-
-        Returns ``None`` where descriptor support is unavailable. The caller
-        owns the returned descriptor and must close it.
+        Where descriptor support exists, each component is created and opened
+        relative to its parent descriptor with ``O_NOFOLLOW``, so no
+        check-then-act window exists between validation and use. Returns an
+        open descriptor for the final directory; the caller owns it and must
+        close it. Returns ``None`` on the path-based fallback.
         """
-        if not self.descriptor_supported:
+        if self._descriptor is None:
+            current = self.path
+            for part in relative_parts:
+                current /= part
+                if current.is_symlink():
+                    raise ValueError("Refusing to traverse unsafe extraction path")
+                if current.exists() and not current.is_dir():
+                    raise ValueError("Refusing to traverse unsafe extraction path")
+                current.mkdir(exist_ok=True)
             return None
-        return os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        fd = os.dup(self._descriptor)
+        try:
+            for part in relative_parts:
+                try:
+                    os.mkdir(part, dir_fd=fd)
+                except FileExistsError:
+                    pass
+                try:
+                    child = os.open(
+                        part,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                        dir_fd=fd,
+                    )
+                except OSError as exc:
+                    if exc.errno in (errno.ELOOP, errno.ENOTDIR):
+                        raise ValueError(
+                            "Refusing to traverse unsafe extraction path"
+                        ) from exc
+                    raise
+                os.close(fd)
+                fd = child
+        except BaseException:
+            os.close(fd)
+            raise
+        return fd
+
+
+def _parts_below(path: str, root: str) -> tuple[str, ...]:
+    """Return *path*'s components below *root*, matching it textually.
+
+    Both the given and the symlink-resolved spelling of *root* are tried,
+    because policy extraction hands over already-resolved targets.
+    """
+    for candidate in (os.path.abspath(root), os.path.realpath(root)):
+        parts = tuple(
+            part
+            for part in os.path.relpath(path, candidate).split(os.sep)
+            if part and part != os.curdir
+        )
+        if os.pardir not in parts:
+            return parts
+    raise ValueError("Refusing to extract outside the destination")
+
+
+def open_secure_parent(path: str, root: str) -> int | None:
+    """Create *path* below *root* without following symlinks beneath *root*.
+
+    *root* is the caller's chosen destination and is trusted, so symlinks in
+    its own path (``/tmp`` on macOS, a symlinked home directory) are resolved.
+    Only components below it, which archive contents can influence, are
+    refused when they are symlinks.
+
+    Returns an open descriptor for the final directory where the platform
+    supports ``dir_fd``-relative operations, ``None`` otherwise. The caller
+    owns the descriptor and must close it, which keeps the guard alive
+    through the caller's own leaf write.
+
+    Raises:
+        ValueError: If *path* is outside *root* or crosses a symlink or file.
+    """
+    parts = _parts_below(path, root)
+    with SecureExtractionRoot(Path(os.path.realpath(root))) as secure_root:
+        return secure_root.ensure_parents(parts)

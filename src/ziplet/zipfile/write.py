@@ -2,17 +2,9 @@
 
 from __future__ import annotations
 
-import binascii
 import io
 from enum import Enum
 from typing import IO, TYPE_CHECKING, cast
-
-try:
-    import zlib
-
-    crc32 = zlib.crc32
-except ImportError:
-    crc32 = binascii.crc32
 
 from ziplet.compression import Registry, registry
 from ziplet.compression.methods import CompressorBase
@@ -24,7 +16,7 @@ if TYPE_CHECKING:
 
 from ziplet.cryptography.base import BaseZipEncryptor
 from ziplet.zipfile.info import ZipInfo
-from ziplet.zipfile.shared import ZIP64_LIMIT
+from ziplet.zipfile.shared import ZIP64_LIMIT, crc32
 from ziplet.zipfile.write_coordinator import WriterReservation
 
 __all__ = ["ZipWriteFile"]
@@ -122,7 +114,7 @@ class ZipWriteFile(io.BufferedIOBase):
         """
         header = self._zinfo.FileHeader(self._zip64)
         # From this point onwards, we have modified the archive.
-        self._zipfile._didModify = True
+        self._zipfile._mark_modified()
         _write_all(self._fileobj, header)
 
     def _write_encryption_header(self) -> None:
@@ -258,8 +250,7 @@ class ZipWriteFile(io.BufferedIOBase):
         self._fileobj.seek(self._zipfile.start_dir)
 
     def _register_entry(self) -> None:
-        self._zipfile.filelist.append(self._zinfo)
-        self._zipfile.NameToInfo[self._zinfo.filename] = self._zinfo
+        self._zipfile._add_entry(self._zinfo)
 
 
 def _write_all(fileobj: IO[bytes], data: bytes) -> None:

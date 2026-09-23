@@ -94,7 +94,17 @@ class WriteCoordinator:
     def ensure_readable(self) -> None:
         with self._condition:
             if self.active:
-                raise ValueError("Cannot read while a ZIP writer is active")
+                raise ValueError(
+                    "Can't read from the ZIP file while there is an open writing "
+                    "handle on it. Close the writing handle before trying to read."
+                )
+
+    def ensure_writable(self) -> None:
+        with self._condition:
+            if self.active:
+                raise ValueError(
+                    "Can't write to ZIP archive while an open writing handle exists"
+                )
 
     def _require(self, reservation: WriterReservation) -> None:
         if self._reservation != reservation:

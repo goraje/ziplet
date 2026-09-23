@@ -1,24 +1,34 @@
+import os
 import struct
+from typing import Literal, TypeAlias
+
+try:
+    from zlib import crc32
+except ImportError:  # pragma: no cover - zlib is optional in some builds
+    from binascii import crc32
 
 __all__ = [
+    "ReadWriteMode",
+    "StrPath",
+    "crc32",
     "DEFAULT_VERSION",
     "ZIP64_VERSION",
     "MAX_EXTRACT_VERSION",
-    "structEndArchive",
-    "stringEndArchive",
-    "sizeEndCentDir",
-    "structCentralDir",
-    "stringCentralDir",
-    "sizeCentralDir",
-    "structFileHeader",
-    "stringFileHeader",
-    "sizeFileHeader",
-    "structEndArchive64Locator",
-    "stringEndArchive64Locator",
-    "sizeEndCentDir64Locator",
-    "structEndArchive64",
-    "stringEndArchive64",
-    "sizeEndCentDir64",
+    "END_ARCHIVE_STRUCT",
+    "END_ARCHIVE_SIGNATURE",
+    "END_ARCHIVE_SIZE",
+    "CENTRAL_DIR_STRUCT",
+    "CENTRAL_DIR_SIGNATURE",
+    "CENTRAL_DIR_SIZE",
+    "FILE_HEADER_STRUCT",
+    "FILE_HEADER_SIGNATURE",
+    "FILE_HEADER_SIZE",
+    "END_ARCHIVE64_LOCATOR_STRUCT",
+    "END_ARCHIVE64_LOCATOR_SIGNATURE",
+    "END_ARCHIVE64_LOCATOR_SIZE",
+    "END_ARCHIVE64_STRUCT",
+    "END_ARCHIVE64_SIGNATURE",
+    "END_ARCHIVE64_SIZE",
     "ZIP64_LIMIT",
     "ZIP_FILECOUNT_LIMIT",
     "ZIP_MAX_COMMENT",
@@ -42,29 +52,29 @@ MAX_EXTRACT_VERSION = 63
 # ---------------------------------------------------------------------------
 
 # End of central directory
-structEndArchive = b"<4s4H2LH"
-stringEndArchive = b"PK\005\006"
-sizeEndCentDir = struct.calcsize(structEndArchive)
+END_ARCHIVE_STRUCT = b"<4s4H2LH"
+END_ARCHIVE_SIGNATURE = b"PK\005\006"
+END_ARCHIVE_SIZE = struct.calcsize(END_ARCHIVE_STRUCT)
 
 # Central directory
-structCentralDir = "<4s4B4HL2L5H2L"
-stringCentralDir = b"PK\001\002"
-sizeCentralDir = struct.calcsize(structCentralDir)
+CENTRAL_DIR_STRUCT = "<4s4B4HL2L5H2L"
+CENTRAL_DIR_SIGNATURE = b"PK\001\002"
+CENTRAL_DIR_SIZE = struct.calcsize(CENTRAL_DIR_STRUCT)
 
 # Local file header
-structFileHeader = "<4s2B4HL2L2H"
-stringFileHeader = b"PK\003\004"
-sizeFileHeader = struct.calcsize(structFileHeader)
+FILE_HEADER_STRUCT = "<4s2B4HL2L2H"
+FILE_HEADER_SIGNATURE = b"PK\003\004"
+FILE_HEADER_SIZE = struct.calcsize(FILE_HEADER_STRUCT)
 
 # Zip64 end-of-central-directory locator
-structEndArchive64Locator = "<4sLQL"
-stringEndArchive64Locator = b"PK\x06\x07"
-sizeEndCentDir64Locator = struct.calcsize(structEndArchive64Locator)
+END_ARCHIVE64_LOCATOR_STRUCT = "<4sLQL"
+END_ARCHIVE64_LOCATOR_SIGNATURE = b"PK\x06\x07"
+END_ARCHIVE64_LOCATOR_SIZE = struct.calcsize(END_ARCHIVE64_LOCATOR_STRUCT)
 
 # Zip64 end-of-central-directory record
-structEndArchive64 = "<4sQ2H2L4Q"
-stringEndArchive64 = b"PK\x06\x06"
-sizeEndCentDir64 = struct.calcsize(structEndArchive64)
+END_ARCHIVE64_STRUCT = "<4sQ2H2L4Q"
+END_ARCHIVE64_SIGNATURE = b"PK\x06\x06"
+END_ARCHIVE64_SIZE = struct.calcsize(END_ARCHIVE64_STRUCT)
 
 # ---------------------------------------------------------------------------
 # Size limits
@@ -82,3 +92,9 @@ MASK_COMPRESSED_PATCH = 1 << 5
 MASK_STRONG_ENCRYPTION = 1 << 6
 MASK_UTF_FILENAME = 1 << 11
 MASK_USE_DATA_DESCRIPTOR = 1 << 3
+
+# ---------------------------------------------------------------------------
+# Type aliases shared by the public-facing modules
+# ---------------------------------------------------------------------------
+StrPath: TypeAlias = str | os.PathLike[str]
+ReadWriteMode: TypeAlias = Literal["r", "w"]

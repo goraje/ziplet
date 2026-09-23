@@ -1,22 +1,16 @@
-"""ZipFile and PyZipFile classes, plus module-level helper functions."""
+"""The :class:`ZipFile` archive class and the :func:`is_zipfile` helper."""
 
 from __future__ import annotations
 
-import binascii
-import io
 import os
-import secrets
 import shutil
-import stat
-import struct
-import tempfile
 import threading
 import warnings
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from pathlib import Path
 from types import TracebackType
-from typing import IO, TYPE_CHECKING, Any, Literal, TypeAlias, cast, overload
+from typing import IO, TYPE_CHECKING, Literal, TypeAlias, cast, overload
 
 if TYPE_CHECKING:
     from typing_extensions import Self
@@ -29,13 +23,6 @@ else:
 if TYPE_CHECKING:
     from ziplet.cryptography.base import BaseZipEncryptor
 
-try:
-    import zlib
-
-    crc32 = zlib.crc32
-except ImportError:
-    crc32 = binascii.crc32
-
 from ziplet.compression import ZIP_LZMA, ZIP_STORED, Registry, registry
 from ziplet.cryptography import WZ_AES, ZIP_CRYPTO
 from ziplet.cryptography.aes import AesZipEncryptor
@@ -43,14 +30,10 @@ from ziplet.cryptography.zipcrypto import ZipCryptoEncryptor
 from ziplet.exceptions import BadZipFile, LargeZipFile
 from ziplet.zipfile.assessment import (
     ArchiveAssessment,
-    ExtractionContext,
-    ValidationState,
 )
-from ziplet.zipfile.exceptions import (
-    ExtractionFailure,
-    ExtractionMaterializationError,
-    ExtractionQuotaExceeded,
-    ExtractionSecurityError,
+from ziplet.zipfile.assessor import (
+    assess_archive,
+    default_assessment_policy,
 )
 from ziplet.zipfile.ext import ZipExtFile
 from ziplet.zipfile.extract import (
@@ -58,61 +41,42 @@ from ziplet.zipfile.extract import (
     ExtractMemberResult,
     ExtractPolicy,
     ExtractResult,
-    ExtractViolation,
-    MemberAssessment,
-    MemberStatus,
-    OverwritePolicy,
-    ViolationAction,
     normalized_destination,
-    resolve_rule,
 )
 from ziplet.zipfile.info import ZipInfo
-from ziplet.zipfile.inspection import InspectionMember, InspectionResult
+from ziplet.zipfile.inspection import (
+    InspectionMember,
+    InspectionResult,
+    build_inspection_result,
+)
 from ziplet.zipfile.io_wrappers import (
     ClosableZipStream,
     Tellable,
 )
 from ziplet.zipfile.materialize import (
+    ExtractionQuota,
     MaterializationResult,
-    MaterializeParams,
-    Materializer,
+    materialize_member,
 )
-from ziplet.zipfile.secure_fs import SecureExtractionRoot
+from ziplet.zipfile.policy_extraction import extract_with_policy
+from ziplet.zipfile.records import (
+    looks_like_zip,
+    read_directory,
+    read_local_header,
+    write_directory,
+)
 from ziplet.zipfile.shared import (
     MASK_COMPRESS_OPTION_1,
-    MASK_COMPRESSED_PATCH,
     MASK_ENCRYPTED,
-    MASK_STRONG_ENCRYPTION,
     MASK_USE_DATA_DESCRIPTOR,
-    MASK_UTF_FILENAME,
-    MAX_EXTRACT_VERSION,
     ZIP64_LIMIT,
     ZIP_FILECOUNT_LIMIT,
     ZIP_MAX_COMMENT,
-    sizeCentralDir,
-    sizeEndCentDir,
-    sizeEndCentDir64,
-    sizeEndCentDir64Locator,
-    sizeFileHeader,
-    stringCentralDir,
-    stringEndArchive,
-    stringEndArchive64,
-    stringEndArchive64Locator,
-    stringFileHeader,
-    structCentralDir,
-    structEndArchive,
-    structEndArchive64,
-    structEndArchive64Locator,
-    structFileHeader,
+    ReadWriteMode,
+    StrPath,
 )
 from ziplet.zipfile.validators import (
-    EXTRACT_VALIDATORS,
-    ValidatorParams,
-    ValidatorPipeline,
-    _entry_mode,
-    _entry_type,
-    _member_target_name,
-    resolve_extract_target,
+    member_target_name,
 )
 from ziplet.zipfile.write import ZipWriteFile
 from ziplet.zipfile.write_coordinator import WriteCoordinator
@@ -130,8 +94,25 @@ __all__ = [
 # Type aliases
 # ---------------------------------------------------------------------------
 _ZipFileMode: TypeAlias = Literal["r", "w", "x", "a"]
-_ReadWriteMode: TypeAlias = Literal["r", "w"]
-_StrPath: TypeAlias = str | os.PathLike[str]
+
+# File modes tried in order when opening an archive path: appending falls back
+# to creating the file, and a read/write handle falls back to write-only.
+_OPEN_MODES = {
+    "r": ("rb",),
+    "w": ("w+b", "wb"),
+    "x": ("x+b", "xb"),
+    "a": ("r+b", "w+b", "wb"),
+}
+
+
+def _open_archive_file(path: str, mode: str) -> IO[bytes]:
+    *fallbacks, last = _OPEN_MODES[mode]
+    for file_mode in fallbacks:
+        try:
+            return open(path, file_mode)
+        except OSError:
+            continue
+    return open(path, last)
 
 
 class _InheritEncryption:
@@ -145,311 +126,7 @@ INHERIT_ENCRYPTION = _InheritEncryption()
 EncryptionOverride: TypeAlias = str | None | _InheritEncryption
 
 
-class _ExtractionQuotaWriter:
-    def __init__(
-        self,
-        target: IO[bytes],
-        *,
-        member_limit: int | None,
-        total_limit: int | None,
-        total_written: int,
-    ) -> None:
-        self._target = target
-        self._member_limit = member_limit
-        self._total_limit = total_limit
-        self._total_written = total_written
-        self.member_written = 0
-
-    def write(self, data: bytes) -> int:
-        requested = len(data)
-        member_total = self.member_written + requested
-        if self._member_limit is not None and member_total > self._member_limit:
-            raise ExtractionQuotaExceeded("actual_member_size", self._member_limit)
-        if (
-            self._total_limit is not None
-            and self._total_written + member_total > self._total_limit
-        ):
-            raise ExtractionQuotaExceeded(
-                "actual_total_uncompressed_size", self._total_limit
-            )
-        written = self._target.write(data)
-        self.member_written += written
-        return written
-
-
-def _open_unique_temp_fd(dir_fd: int, prefix: str = ".ziplet-") -> tuple[str, int]:
-    """Create a uniquely-named file relative to *dir_fd* and return (name, fd).
-
-    Mirrors ``tempfile.NamedTemporaryFile``'s collision handling, but via
-    ``os.open(..., dir_fd=...)`` so the create is relative to an
-    already-validated directory descriptor instead of a path string.
-    """
-    for _ in range(100):
-        name = f"{prefix}{secrets.token_hex(8)}"
-        try:
-            fd = os.open(
-                name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dir_fd
-            )
-        except FileExistsError:
-            continue
-        return name, fd
-    raise OSError("Could not create a unique temporary file for extraction")
-
-
-# ---------------------------------------------------------------------------
-# Local file header field indices
-# ---------------------------------------------------------------------------
-_FH_SIGNATURE = 0
-_FH_EXTRACT_VERSION = 1  # not actually used, but present in the header
-_FH_EXTRACT_SYSTEM = 2  # not actually used, but present in the header
-_FH_GENERAL_PURPOSE_FLAG_BITS = 3
-_FH_COMPRESSION_METHOD = 4  # not actually used, but present in the header
-_FH_LAST_MOD_TIME = 5  # not actually used, but present in the header
-_FH_LAST_MOD_DATE = 6  # not actually used, but present in the header
-_FH_CRC = 7  # not actually used, but present in the header
-_FH_COMPRESSED_SIZE = 8  # not actually used, but present in the header
-_FH_UNCOMPRESSED_SIZE = 9  # not actually used, but present in the header
-_FH_FILENAME_LENGTH = 10
-_FH_EXTRA_FIELD_LENGTH = 11
-
-# ---------------------------------------------------------------------------
-# End-of-central-directory field indices (local to this module)
-# ---------------------------------------------------------------------------
-_ECD_SIGNATURE = 0
-_ECD_DISK_NUMBER = 1
-_ECD_DISK_START = 2
-_ECD_ENTRIES_THIS_DISK = 3
-_ECD_ENTRIES_TOTAL = 4
-_ECD_SIZE = 5
-_ECD_OFFSET = 6
-_ECD_COMMENT_SIZE = 7
-_ECD_COMMENT = 8
-_ECD_LOCATION = 9
-
-# ---------------------------------------------------------------------------
-# Central directory field indices
-# ---------------------------------------------------------------------------
-_CD_SIGNATURE = 0
-_CD_CREATE_VERSION = 1
-_CD_CREATE_SYSTEM = 2
-_CD_EXTRACT_VERSION = 3
-_CD_EXTRACT_SYSTEM = 4
-_CD_FLAG_BITS = 5
-_CD_COMPRESS_TYPE = 6
-_CD_TIME = 7
-_CD_DATE = 8
-_CD_CRC = 9
-_CD_COMPRESSED_SIZE = 10
-_CD_UNCOMPRESSED_SIZE = 11
-_CD_FILENAME_LENGTH = 12
-_CD_EXTRA_FIELD_LENGTH = 13
-_CD_COMMENT_LENGTH = 14
-_CD_DISK_NUMBER_START = 15
-_CD_INTERNAL_FILE_ATTRIBUTES = 16
-_CD_EXTERNAL_FILE_ATTRIBUTES = 17
-_CD_LOCAL_HEADER_OFFSET = 18
-
-# ---------------------------------------------------------------------------
-# Zip64 central directory field indices
-# ---------------------------------------------------------------------------
-_CD64_SIGNATURE = 0
-_CD64_DIRECTORY_RECSIZE = 1
-_CD64_CREATE_VERSION = 2  # not actually used, but present in the record
-_CD64_EXTRACT_VERSION = 3  # not actually used, but present in the record
-_CD64_DISK_NUMBER = 4
-_CD64_DISK_NUMBER_START = 5
-_CD64_NUMBER_ENTRIES_THIS_DISK = 6
-_CD64_NUMBER_ENTRIES_TOTAL = 7
-_CD64_DIRECTORY_SIZE = 8
-_CD64_OFFSET_START_CENTDIR = 9
-
-
-def _handle_prepended_data(endrec: list[Any], debug: int = 0) -> tuple[int, int]:
-    """Compute the central directory offset and prepended-data adjustment.
-
-    Args:
-        endrec: End-of-central-directory record fields as a list.
-        debug: Debug verbosity level; prints diagnostics when greater than 2.
-
-    Returns:
-        A tuple of ``(offset_cd, concat)`` where *offset_cd* is the raw
-        central directory offset from the record and *concat* is the number
-        of prepended bytes before the ZIP data (zero for a normal,
-        non-concatenated archive).
-    """
-    size_cd = endrec[_ECD_SIZE]  # bytes in central directory
-    offset_cd = endrec[_ECD_OFFSET]  # offset of central directory
-
-    # "concat" is zero, unless zip was concatenated to another file
-    concat = endrec[_ECD_LOCATION] - size_cd - offset_cd
-
-    if debug > 2:
-        inferred = concat + offset_cd
-        print("given, inferred, offset", offset_cd, inferred, concat)
-
-    return offset_cd, concat
-
-
-def _EndRecData64(fpin: IO[bytes], offset: int, endrec: list[Any]) -> list[Any]:
-    """Read the ZIP64 end-of-archive records and update *endrec*.
-
-    Looks for the ZIP64 end-of-central-directory locator and, if present,
-    reads the ZIP64 end-of-central-directory record and overwrites the
-    corresponding fields in *endrec* with their 64-bit counterparts.
-
-    Args:
-        fpin: Open binary file positioned anywhere; seeks as needed.
-        offset: Byte offset of the standard end-of-central-directory record.
-        endrec: End-of-central-directory fields as a mutable list, modified
-            in place when ZIP64 data is found.
-
-    Returns:
-        The (possibly updated) *endrec* list.
-
-    Raises:
-        OSError: If a required structure cannot be fully read.
-        BadZipFile: If the archive spans multiple disks, the locator or ZIP64
-            end record is corrupt, or the ZIP64 end record is not found.
-    """
-    offset -= sizeEndCentDir64Locator
-    if offset < 0:
-        return endrec
-    fpin.seek(offset)
-    data = fpin.read(sizeEndCentDir64Locator)
-    if len(data) != sizeEndCentDir64Locator:
-        raise OSError("Unknown I/O error")
-    sig, diskno, reloff, disks = struct.unpack(structEndArchive64Locator, data)
-    if sig != stringEndArchive64Locator:
-        return endrec
-
-    if diskno != 0 or disks > 1:
-        raise BadZipFile("zipfiles that span multiple disks are not supported")
-
-    offset -= sizeEndCentDir64
-    if reloff > offset:
-        raise BadZipFile("Corrupt zip64 end of central directory locator")
-    fpin.seek(reloff)
-    extrasz = offset - reloff
-    data = fpin.read(sizeEndCentDir64)
-    if len(data) != sizeEndCentDir64:
-        raise OSError("Unknown I/O error")
-    if not data.startswith(stringEndArchive64) and reloff != offset:
-        fpin.seek(offset)
-        extrasz = 0
-        data = fpin.read(sizeEndCentDir64)
-        if len(data) != sizeEndCentDir64:
-            raise OSError("Unknown I/O error")
-    if not data.startswith(stringEndArchive64):
-        raise BadZipFile("Zip64 end of central directory record not found")
-
-    endrec64 = struct.unpack(structEndArchive64, data)
-    if (
-        endrec64[_CD64_OFFSET_START_CENTDIR] + endrec64[_CD64_DIRECTORY_SIZE] != reloff
-        or endrec64[_CD64_DIRECTORY_RECSIZE] + 12 != sizeEndCentDir64 + extrasz
-    ):
-        raise BadZipFile("Corrupt zip64 end of central directory record")
-
-    endrec[_ECD_SIGNATURE] = endrec64[_CD64_SIGNATURE]
-    endrec[_ECD_DISK_NUMBER] = endrec64[_CD64_DISK_NUMBER]
-    endrec[_ECD_DISK_START] = endrec64[_CD64_DISK_NUMBER_START]
-    endrec[_ECD_ENTRIES_THIS_DISK] = endrec64[_CD64_NUMBER_ENTRIES_THIS_DISK]
-    endrec[_ECD_ENTRIES_TOTAL] = endrec64[_CD64_NUMBER_ENTRIES_TOTAL]
-    endrec[_ECD_SIZE] = endrec64[_CD64_DIRECTORY_SIZE]
-    endrec[_ECD_OFFSET] = endrec64[_CD64_OFFSET_START_CENTDIR]
-    endrec[_ECD_LOCATION] = offset - extrasz
-    return endrec
-
-
-def _EndRecData(fpin: IO[bytes]) -> list[Any] | None:
-    """Return data from the end-of-central-directory record, or ``None``.
-
-    Searches for the ``PK\x05\x06`` signature at or near the end of *fpin*,
-    handles archives with a comment, and delegates to :func:`_EndRecData64`
-    to upgrade to ZIP64 values when applicable.
-
-    Args:
-        fpin: Open binary file to search.
-
-    Returns:
-        A list of end-of-central-directory fields (including the archive
-        comment and the file offset of the record), or ``None`` if no valid
-        record can be found.
-    """
-    fpin.seek(0, 2)
-    filesize = fpin.tell()
-
-    try:
-        fpin.seek(-sizeEndCentDir, 2)
-    except OSError:
-        return None
-    data = fpin.read(sizeEndCentDir)
-    if (
-        len(data) == sizeEndCentDir
-        and data[0:4] == stringEndArchive
-        and data[-2:] == b"\000\000"
-    ):
-        endrec = list(struct.unpack(structEndArchive, data))
-        endrec.append(b"")
-        endrec.append(filesize - sizeEndCentDir)
-        return _EndRecData64(fpin, filesize - sizeEndCentDir, endrec)
-
-    maxCommentStart = max(filesize - ZIP_MAX_COMMENT - sizeEndCentDir, 0)
-    fpin.seek(maxCommentStart, 0)
-    data = fpin.read(ZIP_MAX_COMMENT + sizeEndCentDir)
-    start = data.rfind(stringEndArchive)
-    if start >= 0:
-        recData = data[start : start + sizeEndCentDir]
-        if len(recData) != sizeEndCentDir:
-            return None
-        endrec = list(struct.unpack(structEndArchive, recData))
-        commentSize = endrec[_ECD_COMMENT_SIZE]
-        comment = data[start + sizeEndCentDir : start + sizeEndCentDir + commentSize]
-        if len(comment) != commentSize or start + sizeEndCentDir + commentSize > len(
-            data
-        ):
-            return None
-        endrec.append(comment)
-        endrec.append(maxCommentStart + start)
-        return _EndRecData64(fpin, maxCommentStart + start, endrec)
-
-    return None
-
-
-def _check_zipfile(fp: IO[bytes]) -> bool:
-    """Return ``True`` if *fp* appears to be a valid ZIP file.
-
-    Reads the end-of-central-directory record and, if present, verifies
-    that the first central directory entry carries the expected signature.
-
-    Args:
-        fp: Open binary file-like object to inspect.
-
-    Returns:
-        ``True`` if a valid ZIP structure is detected, ``False`` otherwise.
-    """
-    try:
-        endrec = _EndRecData(fp)
-        if endrec:
-            if (
-                endrec[_ECD_ENTRIES_TOTAL] == 0
-                and endrec[_ECD_SIZE] == 0
-                and endrec[_ECD_OFFSET] == 0
-            ):
-                return True
-            elif endrec[_ECD_DISK_NUMBER] == endrec[_ECD_DISK_START]:
-                fp.seek(sum(_handle_prepended_data(endrec)))
-                if endrec[_ECD_SIZE] >= sizeCentralDir:
-                    data = fp.read(sizeCentralDir)
-                    if len(data) == sizeCentralDir:
-                        centdir = struct.unpack(structCentralDir, data)
-                        if centdir[_CD_SIGNATURE] == stringCentralDir:
-                            return True
-    except OSError:
-        pass
-    return False
-
-
-def is_zipfile(filename: _StrPath | IO[bytes]) -> bool:
+def is_zipfile(filename: StrPath | IO[bytes]) -> bool:
     """Return ``True`` if *filename* is a valid ZIP file based on its magic number.
 
     Args:
@@ -464,11 +141,11 @@ def is_zipfile(filename: _StrPath | IO[bytes]) -> bool:
     try:
         if not isinstance(filename, (str, os.PathLike)):
             pos = filename.tell()
-            result = _check_zipfile(fp=filename)
+            result = looks_like_zip(filename)
             filename.seek(pos)
         else:
             with open(filename, "rb") as fp:
-                result = _check_zipfile(fp)
+                result = looks_like_zip(fp)
     except (OSError, BadZipFile):
         pass
     return result
@@ -518,66 +195,11 @@ class ZipFile:
             read. ``None`` defaults to ``'cp437'``.
     """
 
-    _HARD_EXTRACTION_VIOLATIONS = frozenset(
-        {
-            "absolute_path",
-            "windows_drive_path",
-            "windows_path",
-            "parent_traversal",
-            "outside_root",
-            "symlink",
-            "special_file",
-            "unsafe_destination",
-        }
-    )
-
-    _extract_pipeline = ValidatorPipeline(EXTRACT_VALIDATORS)
-
-    @classmethod
-    def _apply_hard_violation_floor(
-        cls, violations: Iterable[ExtractViolation]
-    ) -> list[ExtractViolation]:
-        """Escalate WARN to ERROR for codes that can never be soft-failed.
-
-        Runs after per-check violation actions are already resolved (see
-        :func:`ziplet.zipfile.extract.resolve_rule`), so this only enforces
-        the floor — it does not otherwise touch an already-resolved action.
-        """
-        return [
-            replace(violation, action=ViolationAction.ERROR)
-            if (
-                violation.code in cls._HARD_EXTRACTION_VIOLATIONS
-                and violation.action == ViolationAction.WARN
-            )
-            else violation
-            for violation in violations
-        ]
-
-    def _assess_member(
-        self,
-        info: ZipInfo,
-        destination: Path,
-        policy_root: Path,
-        policy: ExtractPolicy,
-        state: ValidationState,
-    ) -> MemberAssessment:
-        target, _drive, _parts = resolve_extract_target(info, destination)
-        context = ExtractionContext(destination, policy_root, None, policy)
-        params = ValidatorParams(info, target, context, state)
-        violations = self._extract_pipeline.validate(params)
-        violations = self._apply_hard_violation_floor(violations)
-        return MemberAssessment(
-            info,
-            target,
-            tuple(violations),
-            *_entry_type(info),
-        )
-
     fp: IO[bytes] | None = None
 
     def __init__(
         self,
-        file: _StrPath | IO[bytes],
+        file: StrPath | IO[bytes],
         mode: _ZipFileMode = "r",
         compression: int = ZIP_STORED,
         allowZip64: bool = True,
@@ -626,8 +248,8 @@ class ZipFile:
         )
         selected_registry.check_compression(compression)
 
-        self._allowZip64 = allowZip64
-        self._didModify = False
+        self._allow_zip64 = allowZip64
+        self._did_modify = False
         self.debug = 0
         self.NameToInfo: dict[str, ZipInfo] = {}
         self.filelist: list[ZipInfo] = []
@@ -648,32 +270,14 @@ class ZipFile:
         if isinstance(file, os.PathLike):
             file = os.fspath(file)
         if isinstance(file, str):
-            self._filePassed = False
+            self._file_passed = False
             self.filename: str | None = file
-            modeDict = {
-                "r": "rb",
-                "w": "w+b",
-                "x": "x+b",
-                "a": "r+b",
-                "r+b": "w+b",
-                "w+b": "wb",
-                "x+b": "xb",
-            }
-            filemode = modeDict[mode]
-            while True:
-                try:
-                    self.fp = open(file, filemode)
-                except OSError:
-                    if filemode in modeDict:
-                        filemode = modeDict[filemode]
-                        continue
-                    raise
-                break
+            self.fp = _open_archive_file(file, mode)
         else:
-            self._filePassed = True
+            self._file_passed = True
             self.fp = file
             self.filename = getattr(file, "name", None)
-        self._fileRefCnt = 1
+        self._file_ref_cnt = 1
         self._lock = threading.RLock()
         self._write_coordinator = WriteCoordinator(self._lock)
         self._seekable = True
@@ -681,9 +285,9 @@ class ZipFile:
 
         try:
             if mode == "r":
-                self._RealGetContents()
+                self._read_directory()
             elif mode in ("w", "x"):
-                self._didModify = True
+                self._did_modify = True
                 try:
                     self.start_dir = self.fp.tell()
                 except (AttributeError, OSError):
@@ -697,14 +301,12 @@ class ZipFile:
                         self._seekable = False
             elif mode == "a":
                 try:
-                    self._RealGetContents()
+                    self._read_directory()
                     self.fp.seek(self.start_dir)
                 except BadZipFile:
                     self.fp.seek(0, 2)
-                    self._didModify = True
+                    self._did_modify = True
                     self.start_dir = self.fp.tell()
-            else:
-                raise ValueError("Mode must be 'r', 'w', 'x', or 'a'")
         except BaseException:
             fp = self.fp
             self.fp = None
@@ -740,7 +342,7 @@ class ZipFile:
         """
         result = ["<%s.%s" % (self.__class__.__module__, self.__class__.__qualname__)]
         if self.fp is not None:
-            if self._filePassed:
+            if self._file_passed:
                 result.append(" file=%r" % self.fp)
             elif self.filename is not None:
                 result.append(" filename=%r" % self.filename)
@@ -750,111 +352,19 @@ class ZipFile:
         result.append(">")
         return "".join(result)
 
-    def _RealGetContents(self) -> None:
-        """Parse the central directory and populate :attr:`filelist`
-        and :attr:`NameToInfo`.
-
-        Reads the end-of-central-directory record, locates the central
-        directory, decodes every entry, and computes each entry's
-        ``_end_offset`` for overlap detection.
+    def _read_directory(self) -> None:
+        """Populate :attr:`filelist` and :attr:`NameToInfo` from the archive.
 
         Raises:
-            BadZipFile: If the file is not a ZIP archive, the central directory
-                is truncated or corrupt, or an unsupported ZIP version is
-                encountered.
+            BadZipFile: If the file is not a ZIP archive or its central
+                directory is truncated or corrupt.
         """
-        fp = self.fp
-        assert fp is not None
-        try:
-            endrec = _EndRecData(fp)
-        except OSError:
-            raise BadZipFile("File is not a zip file") from None
-        if not endrec:
-            raise BadZipFile("File is not a zip file")
-        if self.debug > 1:
-            print(endrec)
-        self._comment = endrec[_ECD_COMMENT]
-
-        offset_cd, concat = _handle_prepended_data(endrec, self.debug)
-
-        self.start_dir = offset_cd + concat
-
-        if self.start_dir < 0:
-            raise BadZipFile("Bad offset for central directory")
-        fp.seek(self.start_dir, 0)
-        size_cd = endrec[_ECD_SIZE]
-        data = fp.read(size_cd)
-        fp = io.BytesIO(data)
-        total = 0
-        while total < size_cd:
-            centdir_raw = fp.read(sizeCentralDir)
-            if len(centdir_raw) != sizeCentralDir:
-                raise BadZipFile("Truncated central directory")
-            centdir = struct.unpack(structCentralDir, centdir_raw)
-            if centdir[_CD_SIGNATURE] != stringCentralDir:
-                raise BadZipFile("Bad magic number for central directory")
-            if self.debug > 2:
-                print(centdir)
-            filename_bytes = fp.read(centdir[_CD_FILENAME_LENGTH])
-            orig_filename_crc = crc32(filename_bytes)
-            flags = centdir[_CD_FLAG_BITS]
-            if flags & MASK_UTF_FILENAME:
-                filename = filename_bytes.decode("utf-8")
-            else:
-                filename = filename_bytes.decode(self.metadata_encoding or "cp437")
-            x = ZipInfo(filename)
-            x.extra = fp.read(centdir[_CD_EXTRA_FIELD_LENGTH])
-            x.comment = fp.read(centdir[_CD_COMMENT_LENGTH])
-            x.header_offset = centdir[_CD_LOCAL_HEADER_OFFSET]
-            x.create_version = centdir[_CD_CREATE_VERSION]
-            x.create_system = centdir[_CD_CREATE_SYSTEM]
-            x.extract_version = centdir[_CD_EXTRACT_VERSION]
-            x.reserved = centdir[_CD_EXTRACT_SYSTEM]
-            x.flag_bits = centdir[_CD_FLAG_BITS]
-            x.compress_type = centdir[_CD_COMPRESS_TYPE]
-            t = centdir[_CD_TIME]
-            d = centdir[_CD_DATE]
-            x.CRC = centdir[_CD_CRC]
-            x.compress_size = centdir[_CD_COMPRESSED_SIZE]
-            x.file_size = centdir[_CD_UNCOMPRESSED_SIZE]
-            if x.extract_version > MAX_EXTRACT_VERSION:
-                raise NotImplementedError(
-                    "zip file version %.1f" % (x.extract_version / 10)
-                )
-            x.volume = centdir[_CD_DISK_NUMBER_START]
-            x.internal_attr = centdir[_CD_INTERNAL_FILE_ATTRIBUTES]
-            x.external_attr = centdir[_CD_EXTERNAL_FILE_ATTRIBUTES]
-            x._raw_time = t
-            x.date_time = (
-                (d >> 9) + 1980,
-                (d >> 5) & 0xF,
-                d & 0x1F,
-                t >> 11,
-                (t >> 5) & 0x3F,
-                (t & 0x1F) * 2,
-            )
-            x._decodeExtra(orig_filename_crc)
-            x.header_offset = x.header_offset + concat
-            self.filelist.append(x)
-            self.NameToInfo[x.filename] = x
-
-            total = (
-                total
-                + sizeCentralDir
-                + centdir[_CD_FILENAME_LENGTH]
-                + centdir[_CD_EXTRA_FIELD_LENGTH]
-                + centdir[_CD_COMMENT_LENGTH]
-            )
-
-            if self.debug > 2:
-                print("total", total)
-
-        end_offset = self.start_dir
-        for zinfo in reversed(
-            sorted(self.filelist, key=lambda zinfo: zinfo.header_offset)
-        ):
-            zinfo._end_offset = end_offset
-            end_offset = zinfo.header_offset
+        assert self.fp is not None
+        directory = read_directory(self.fp, self.metadata_encoding, self.debug)
+        self._comment = directory.comment
+        self.start_dir = directory.start_dir
+        self.filelist.extend(directory.infos)
+        self.NameToInfo.update((info.filename, info) for info in directory.infos)
 
     def namelist(self) -> list[str]:
         """Return a list of archive member names.
@@ -875,7 +385,7 @@ class ZipFile:
 
     def inspect(
         self,
-        path: _StrPath | None = None,
+        path: StrPath | None = None,
         policy: ExtractPolicy | None = None,
     ) -> InspectionResult:
         """Inspect archive metadata without opening or processing payloads.
@@ -884,157 +394,18 @@ class ZipFile:
         findings are returned in the report and never raise
         :class:`ExtractionError`.
         """
-        effective_policy = (
-            policy
-            if policy is not None
-            else replace(
-                ExtractPolicy(),
-                allow_overwrite=True,
-                overwrite_policy=OverwritePolicy.REPLACE,
-                max_member_size=None,
-                max_total_uncompressed_size=None,
-                max_entries=None,
-                max_compression_ratio=None,
-            )
-        )
-        assessment = self.assess(path, effective_policy)
-        total_entries = len(assessment.members)
-
-        max_entries_rule = resolve_rule(
-            effective_policy.max_entries, effective_policy.on_violation
-        )
-        count_over = (
-            max_entries_rule.value is not None
-            and total_entries > max_entries_rule.value
-        )
-        violations: list[ExtractViolation] = list(assessment.violations)
-        if count_over:
-            violations.append(
-                ExtractViolation(
-                    "<archive>",
-                    "max_entries",
-                    f"archive contains {total_entries} entries, "
-                    f"limit is {max_entries_rule.value}",
-                    max_entries_rule.action,
-                )
-            )
-
-        members: list[InspectionMember] = []
-        encrypted: list[str] = []
-        suspicious: list[str] = []
-        large: list[str] = []
-        ratio_outliers: list[str] = []
-        symlinks: list[str] = []
-        special_files: list[str] = []
-
-        for member_assessment in assessment.members:
-            info = member_assessment.info
-            target = member_assessment.target
-            member_violations = member_assessment.violations
-            is_link = member_assessment.is_symlink
-            is_special = member_assessment.is_special
-            ratio = (
-                None if info.compress_size == 0 else info.file_size / info.compress_size
-            )
-            if info.flag_bits & MASK_ENCRYPTED:
-                encrypted.append(info.filename)
-            if is_link:
-                symlinks.append(info.filename)
-            if is_special:
-                special_files.append(info.filename)
-            if any(
-                violation.code
-                in {
-                    "absolute_path",
-                    "windows_path",
-                    "windows_drive_path",
-                    "parent_traversal",
-                    "outside_root",
-                }
-                for violation in member_violations
-            ):
-                suspicious.append(info.filename)
-            if any(v.code == "max_member_size" for v in member_violations):
-                large.append(info.filename)
-            if any(v.code == "compression_ratio" for v in member_violations):
-                ratio_outliers.append(info.filename)
-            members.append(
-                InspectionMember(
-                    info.filename,
-                    target,
-                    info.is_dir(),
-                    info.compress_size,
-                    info.file_size,
-                    ratio,
-                    bool(info.flag_bits & MASK_ENCRYPTED),
-                    is_link,
-                    is_special,
-                    member_violations,
-                )
-            )
-
-        warnings = tuple(v for v in violations if v.action == ViolationAction.WARN)
-        return InspectionResult(
-            total_entries,
-            assessment.total_compressed_size,
-            assessment.total_uncompressed_size,
-            tuple(members),
-            assessment.duplicate_member_names,
-            assessment.duplicate_targets,
-            tuple(dict.fromkeys(suspicious)),
-            tuple(encrypted),
-            tuple(large),
-            tuple(ratio_outliers),
-            tuple(symlinks),
-            tuple(special_files),
-            warnings,
-            tuple(violations),
-            count_over,
+        effective_policy = policy or default_assessment_policy()
+        return build_inspection_result(
+            self.assess(path, effective_policy), effective_policy
         )
 
     def assess(
         self,
-        path: _StrPath | None = None,
+        path: StrPath | None = None,
         policy: ExtractPolicy | None = None,
     ) -> ArchiveAssessment:
         """Return the metadata assessment shared by policy consumers."""
-        effective_policy = policy or replace(
-            ExtractPolicy(),
-            allow_overwrite=True,
-            overwrite_policy=OverwritePolicy.REPLACE,
-            max_member_size=None,
-            max_total_uncompressed_size=None,
-            max_entries=None,
-            max_compression_ratio=None,
-        )
-        destination = normalized_destination(path or os.getcwd())
-        root = normalized_destination(effective_policy.destination_root or destination)
-        state = ValidationState()
-        members: list[MemberAssessment] = []
-        violations: list[ExtractViolation] = []
-        duplicate_targets: list[Path] = []
-        for info in self.filelist:
-            state.names[info.filename] = state.names.get(info.filename, 0) + 1
-            state.total_declared += info.file_size
-            state.total_compressed += info.compress_size
-            before = set(state.targets)
-            assessment = self._assess_member(
-                info, destination, root, effective_policy, state
-            )
-            state.member_index += 1
-            if assessment.target is not None and assessment.target in before:
-                duplicate_targets.append(assessment.target)
-            members.append(assessment)
-            violations.extend(assessment.violations)
-        return ArchiveAssessment(
-            destination,
-            tuple(members),
-            tuple(violations),
-            state.total_compressed,
-            state.total_declared,
-            tuple(name for name, count in state.names.items() if count > 1),
-            tuple(dict.fromkeys(duplicate_targets)),
-        )
+        return assess_archive(self.filelist, path, policy)
 
     def printdir(self, file: IO[str] | None = None) -> None:
         """Print a formatted table of contents to *file*.
@@ -1106,15 +477,22 @@ class ZipFile:
         nbits: int | None = None,
         force_wz_aes_version: int | None = None,
     ) -> BaseZipEncryptor:
-        """Construct and return an encryptor for the current encryption setting.
+        """Construct an encryptor, defaulting to this archive's settings.
+
+        Args:
+            encryption: Encryption scheme; defaults to :attr:`encryption`.
+            password: Encryption password; defaults to :attr:`pwd`.
+            nbits: AES key size in bits; defaults to the archive's setting.
+            force_wz_aes_version: WinZip AES version override; defaults to the
+                archive's setting.
 
         Returns:
-            A :class:`~ziplet.cryptography.base.BaseZipEncryptor`
-            appropriate for :attr:`encryption`.
+            A :class:`~ziplet.cryptography.base.BaseZipEncryptor` for the
+            selected scheme.
 
         Raises:
-            AssertionError: If :attr:`pwd` is ``None``.
-            NotImplementedError: If :attr:`encryption` is an unknown scheme.
+            RuntimeError: If no password is available.
+            NotImplementedError: If the encryption scheme is unknown.
         """
         method = self.encryption if encryption is None else encryption
         pwd = self.pwd if password is None else password
@@ -1150,7 +528,7 @@ class ZipFile:
             )
             comment = comment[:ZIP_MAX_COMMENT]
         self._comment = comment
-        self._didModify = True
+        self._did_modify = True
 
     def read(self, name: str | ZipInfo, pwd: bytes | None = None) -> bytes:
         """Return the decompressed bytes for the archive member named *name*.
@@ -1169,7 +547,7 @@ class ZipFile:
     def open(
         self,
         name: str | ZipInfo,
-        mode: _ReadWriteMode = "r",
+        mode: ReadWriteMode = "r",
         pwd: bytes | None = None,
         *,
         force_zip64: bool = False,
@@ -1231,17 +609,12 @@ class ZipFile:
                 ),
             )
 
-        if self._write_coordinator.active:
-            raise ValueError(
-                "Can't read from the ZIP file while there "
-                "is an open writing handle on it. "
-                "Close the writing handle before trying to read."
-            )
+        self._write_coordinator.ensure_readable()
 
         return cast(IO[bytes], self._open_to_read(mode, zinfo, pwd))
 
     def _open_to_read(
-        self, mode: _ReadWriteMode, zinfo: ZipInfo, pwd: bytes | None
+        self, mode: ReadWriteMode, zinfo: ZipInfo, pwd: bytes | None
     ) -> ZipExtFile:
         """Open *zinfo* for reading and return a ZipExtFile.
 
@@ -1270,7 +643,7 @@ class ZipFile:
             TypeError: If *pwd* is not ``bytes``.
         """
         assert self.fp is not None
-        self._fileRefCnt += 1
+        self._file_ref_cnt += 1
         zef_file = ClosableZipStream(
             self.fp,
             zinfo.header_offset,
@@ -1279,33 +652,7 @@ class ZipFile:
             lambda: self._write_coordinator.active,
         )
         try:
-            fheader_raw = zef_file.read(sizeFileHeader)
-            if len(fheader_raw) != sizeFileHeader:
-                raise BadZipFile("Truncated file header")
-            fheader = struct.unpack(structFileHeader, fheader_raw)
-            if fheader[_FH_SIGNATURE] != stringFileHeader:
-                raise BadZipFile("Bad magic number for file header")
-
-            fname = zef_file.read(fheader[_FH_FILENAME_LENGTH])
-            if fheader[_FH_EXTRA_FIELD_LENGTH]:
-                zef_file.seek(fheader[_FH_EXTRA_FIELD_LENGTH], whence=1)
-
-            if zinfo.flag_bits & MASK_COMPRESSED_PATCH:
-                raise NotImplementedError("compressed patched data (flag bit 5)")
-
-            if zinfo.flag_bits & MASK_STRONG_ENCRYPTION:
-                raise NotImplementedError("strong encryption (flag bit 6)")
-
-            if fheader[_FH_GENERAL_PURPOSE_FLAG_BITS] & MASK_UTF_FILENAME:
-                fname_str = fname.decode("utf-8")
-            else:
-                fname_str = fname.decode(self.metadata_encoding or "cp437")
-
-            if fname_str != zinfo.orig_filename:
-                raise BadZipFile(
-                    "File name in directory %r and header %r differ."
-                    % (zinfo.orig_filename, fname)
-                )
+            read_local_header(zef_file, zinfo, self.metadata_encoding)
 
             if (
                 zinfo._end_offset is not None
@@ -1374,7 +721,7 @@ class ZipFile:
                 or if a write handle is already open.
             LargeZipFile: If ZIP64 is required but not allowed.
         """
-        if force_zip64 and not self._allowZip64:
+        if force_zip64 and not self._allow_zip64:
             raise ValueError(
                 "force_zip64 is True, but allowZip64 was False when opening "
                 "the ZIP file."
@@ -1394,7 +741,7 @@ class ZipFile:
             zinfo.external_attr = 0o600 << 16
 
         zip64 = force_zip64 or (zinfo.file_size + zinfo.file_size // 20 > ZIP64_LIMIT)
-        if not self._allowZip64 and zip64:
+        if not self._allow_zip64 and zip64:
             raise LargeZipFile("Filesize would require ZIP64 extensions")
 
         assert self.fp is not None
@@ -1402,8 +749,8 @@ class ZipFile:
             self.fp.seek(self.start_dir)
         zinfo.header_offset = self.fp.tell()
 
-        self._writecheck(zinfo)
-        self._didModify = True
+        self._check_writable(zinfo)
+        self._mark_modified()
 
         effective_encryption = (
             self.encryption if encryption is INHERIT_ENCRYPTION else encryption
@@ -1413,18 +760,11 @@ class ZipFile:
         encryptor = None
         if effective_encryption:
             zinfo.flag_bits |= MASK_ENCRYPTED
-            effective_extra = extra
-            if effective_extra is None:
-                nbits = self._wz_aes_nbits
-                aes_version = self._force_wz_aes_version
-            else:
-                nbits = effective_extra.wz_aes_nbits
-                aes_version = effective_extra.force_wz_aes_version
             encryptor = self.get_encryptor(
                 cast(str, effective_encryption),
                 password,
-                nbits=nbits,
-                force_wz_aes_version=aes_version,
+                nbits=extra.wz_aes_nbits if extra else None,
+                force_wz_aes_version=extra.force_wz_aes_version if extra else None,
             )
 
         try:
@@ -1440,7 +780,7 @@ class ZipFile:
     def extract(
         self,
         member: str | ZipInfo,
-        path: _StrPath | None = None,
+        path: StrPath | None = None,
         pwd: bytes | None = None,
         *,
         policy: None = None,
@@ -1450,7 +790,7 @@ class ZipFile:
     def extract(
         self,
         member: str | ZipInfo,
-        path: _StrPath | None = None,
+        path: StrPath | None = None,
         pwd: bytes | None = None,
         *,
         policy: ExtractPolicy,
@@ -1459,7 +799,7 @@ class ZipFile:
     def extract(
         self,
         member: str | ZipInfo,
-        path: _StrPath | None = None,
+        path: StrPath | None = None,
         pwd: bytes | None = None,
         *,
         policy: ExtractPolicy | None = None,
@@ -1487,16 +827,13 @@ class ZipFile:
                 raise ExtractionError(result)
             return result.members[0]
 
-        if path is None:
-            path = os.getcwd()
-        else:
-            path = os.fspath(path)
+        path = os.fspath(os.getcwd() if path is None else path)
         return str(self._extract_member(member, path, pwd).target)
 
     @overload
     def extractall(
         self,
-        path: _StrPath | None = None,
+        path: StrPath | None = None,
         members: Iterable[str | ZipInfo] | None = None,
         pwd: bytes | None = None,
         *,
@@ -1506,7 +843,7 @@ class ZipFile:
     @overload
     def extractall(
         self,
-        path: _StrPath | None = None,
+        path: StrPath | None = None,
         members: Iterable[str | ZipInfo] | None = None,
         pwd: bytes | None = None,
         *,
@@ -1515,7 +852,7 @@ class ZipFile:
 
     def extractall(
         self,
-        path: _StrPath | None = None,
+        path: StrPath | None = None,
         members: Iterable[str | ZipInfo] | None = None,
         pwd: bytes | None = None,
         *,
@@ -1538,10 +875,7 @@ class ZipFile:
             if result.failed_count:
                 raise ExtractionError(result)
             return result
-        if path is None:
-            path = os.getcwd()
-        else:
-            path = os.fspath(path)
+        path = os.fspath(os.getcwd() if path is None else path)
         for zipinfo in members:
             self._extract_member(zipinfo, path, pwd)
         return None
@@ -1549,7 +883,7 @@ class ZipFile:
     def _extract_with_policy(
         self,
         members: list[str | ZipInfo],
-        path: _StrPath | None,
+        path: StrPath | None,
         pwd: bytes | None,
         policy: ExtractPolicy,
     ) -> ExtractResult:
@@ -1563,222 +897,30 @@ class ZipFile:
             member if isinstance(member, ZipInfo) else self.getinfo(member)
             for member in members
         ]
-        violations: list[ExtractViolation] = []
-        results: list[ExtractMemberResult] = []
-        state = ValidationState()
-        total_written = 0
-
-        max_entries_rule = resolve_rule(policy.max_entries, policy.on_violation)
-        if max_entries_rule.value is not None and len(infos) > max_entries_rule.value:
-            violation = ExtractViolation(
-                "<archive>",
-                "max_entries",
-                f"archive contains {len(infos)} entries, "
-                f"limit is {max_entries_rule.value}",
-                max_entries_rule.action,
-            )
-            violations.append(violation)
-        max_total_size_rule = resolve_rule(
-            policy.max_total_uncompressed_size, policy.on_violation
-        )
-
-        for info in infos:
-            state.total_declared += info.file_size
-            state.total_compressed += info.compress_size
-            assessment = self._assess_member(
-                info, destination, policy_root, policy, state
-            )
-            state.member_index += 1
-            target = assessment.target
-            member_violations = list(assessment.violations)
-            violations.extend(member_violations)
-
-            action = (
-                ViolationAction.ERROR
-                if any(v.action == ViolationAction.ERROR for v in member_violations)
-                else (
-                    ViolationAction.SKIP
-                    if any(v.action == ViolationAction.SKIP for v in member_violations)
-                    else ViolationAction.WARN
-                    if member_violations
-                    else None
-                )
-            )
-            if action == ViolationAction.ERROR:
-                results.append(
-                    self._member_result(
-                        info,
-                        MemberStatus.FAILED,
-                        target,
-                        0,
-                        tuple(member_violations),
-                    )
-                )
-                continue
-            if action == ViolationAction.SKIP:
-                results.append(
-                    self._member_result(
-                        info,
-                        MemberStatus.SKIPPED,
-                        target,
-                        0,
-                        tuple(member_violations),
-                    )
-                )
-                continue
-            for violation in member_violations:
-                warnings.warn(violation.message, stacklevel=3)
-
-            if policy.preview_only:
-                results.append(
-                    self._member_result(
-                        info,
-                        MemberStatus.PREVIEWED,
-                        target,
-                        0,
-                        tuple(member_violations),
-                    )
-                )
-                continue
-
-            assert target is not None
-            target = self._prepare_policy_target(target, info, policy)
-            was_existing = target.exists()
-            try:
-                materialized = self._extract_member(
-                    info,
-                    str(destination),
-                    pwd,
-                    target_override=target,
-                    quota_member_limit=resolve_rule(
-                        policy.max_member_size, policy.on_violation
-                    ).value,
-                    quota_total_limit=max_total_size_rule.value,
-                    quota_total_written=total_written,
-                )
-                written_target = str(materialized.target)
-                written = materialized.bytes_written
-                total_written += written
-            except ExtractionQuotaExceeded as exc:
-                violation = ExtractViolation(
-                    info.filename,
-                    exc.code,
-                    str(exc),
-                    ViolationAction.ERROR,
-                    target,
-                )
-                violations.append(violation)
-                results.append(
-                    self._member_result(
-                        info,
-                        MemberStatus.FAILED,
-                        target,
-                        0,
-                        tuple(member_violations) + (violation,),
-                    )
-                )
-                continue
-            except (
-                OSError,
-                ValueError,
-                BadZipFile,
-                RuntimeError,
-                ExtractionFailure,
-            ) as exc:
-                violation = ExtractViolation(
-                    info.filename,
-                    "extraction_error",
-                    str(exc),
-                    ViolationAction.ERROR,
-                    target,
-                )
-                violations.append(violation)
-                results.append(
-                    self._member_result(
-                        info,
-                        MemberStatus.FAILED,
-                        target,
-                        0,
-                        tuple(member_violations) + (violation,),
-                    )
-                )
-                continue
-            results.append(
-                self._member_result(
-                    info,
-                    MemberStatus.EXTRACTED,
-                    Path(written_target),
-                    written,
-                    tuple(member_violations),
-                    was_existing,
-                )
-            )
-
-        extracted = sum(r.status == MemberStatus.EXTRACTED for r in results)
-        skipped = sum(
-            r.status in (MemberStatus.SKIPPED, MemberStatus.PREVIEWED) for r in results
-        )
-        failed = sum(r.status == MemberStatus.FAILED for r in results)
-        if any(v.action == ViolationAction.ERROR for v in violations):
-            failed = max(failed, 1)
-        return ExtractResult(
+        return extract_with_policy(
+            infos,
             destination,
-            tuple(results),
-            tuple(violations),
-            extracted,
-            skipped,
-            failed,
-            sum(r.bytes_written for r in results),
-            policy.preview_only,
+            policy_root,
+            policy,
+            lambda info, target, quota: self._extract_member(
+                info,
+                str(destination),
+                pwd,
+                target_override=target,
+                quota=quota,
+                fsync=policy.fsync_files,
+            ),
         )
-
-    def _member_result(
-        self,
-        info: ZipInfo,
-        status: MemberStatus,
-        target: Path | None,
-        written: int,
-        violations: tuple[ExtractViolation, ...],
-        overwritten: bool = False,
-    ) -> ExtractMemberResult:
-        ratio = None if info.compress_size == 0 else info.file_size / info.compress_size
-        return ExtractMemberResult(
-            info.filename,
-            status,
-            target,
-            info.is_dir(),
-            info.compress_size,
-            info.file_size,
-            ratio,
-            written,
-            violations,
-            overwritten,
-        )
-
-    @staticmethod
-    def _prepare_policy_target(
-        target: Path,
-        info: ZipInfo,
-        policy: ExtractPolicy,
-    ) -> Path:
-        if target.exists() and policy.overwrite_policy == OverwritePolicy.RENAME:
-            stem = target
-            counter = 1
-            while target.exists():
-                target = stem.with_name(f"{stem.name}.{counter}")
-                counter += 1
-        return target
 
     def _extract_member(
         self,
         member: str | ZipInfo,
-        targetpath: str,
+        destination: str,
         pwd: bytes | None,
         *,
         target_override: Path | None = None,
-        quota_member_limit: int | None = None,
-        quota_total_limit: int | None = None,
-        quota_total_written: int = 0,
+        quota: ExtractionQuota | None = None,
+        fsync: bool = True,
     ) -> MaterializationResult:
         """Extract *member* to *targetpath* and return the materialization result.
 
@@ -1789,7 +931,7 @@ class ZipFile:
         Args:
             member: Archive member name or
                 :class:`~ziplet.zipfile.info.ZipInfo` instance.
-            targetpath: Root directory under which the member is extracted.
+            destination: Root directory under which the member is extracted.
             pwd: Decryption password, or ``None``.
 
         Returns:
@@ -1803,220 +945,36 @@ class ZipFile:
         if not isinstance(member, ZipInfo):
             member = self.getinfo(member)
 
-        _, parts = _member_target_name(member.filename)
+        _, parts = member_target_name(member.filename)
         arcname = os.path.sep.join(parts)
 
         if not arcname and not member.is_dir():
             raise ValueError("Empty filename.")
 
         if target_override is None:
-            targetpath = os.path.join(targetpath, arcname)
-            targetpath = os.path.normpath(targetpath)
+            targetpath = os.path.normpath(os.path.join(destination, arcname))
         else:
             targetpath = os.fspath(target_override)
 
-        upperdirs = os.path.dirname(targetpath)
-        dir_fd: int | None = None
-        if upperdirs:
-            dir_fd = self._secure_mkdirs(upperdirs)
-        try:
-            materializer = self._materializer(member)
-            params = MaterializeParams(
-                member,
-                targetpath,
-                pwd,
-                quota_member_limit,
-                quota_total_limit,
-                quota_total_written,
-                upperdirs or ".",
-                dir_fd,
-            )
-            return materializer(params)
-        finally:
-            if dir_fd is not None:
-                os.close(dir_fd)
-
-    def _materializer(self, member: ZipInfo) -> Materializer:
-        if member.is_dir():
-            return self._materialize_directory
-        mode = _entry_mode(member)
-        if stat.S_ISLNK(mode):
-            return self._materialize_symlink
-        if mode and not stat.S_ISREG(mode) and not stat.S_ISDIR(mode):
-            return self._materialize_special
-        return self._materialize_regular_file
-
-    def _materialize_directory(
-        self, params: MaterializeParams
-    ) -> MaterializationResult:
-        targetpath, dir_fd = params.targetpath, params.dir_fd
-        if dir_fd is not None and os.mkdir in os.supports_dir_fd:
-            name = os.path.basename(targetpath)
-            try:
-                leaf_stat = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-            except FileNotFoundError:
-                already_dir = False
-            else:
-                if stat.S_ISLNK(leaf_stat.st_mode):
-                    raise ExtractionSecurityError(
-                        "Refusing to traverse symlinked extraction directory"
-                    )
-                already_dir = stat.S_ISDIR(leaf_stat.st_mode)
-            if not already_dir:
-                try:
-                    os.mkdir(name, dir_fd=dir_fd)
-                except FileExistsError:
-                    recheck = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-                    if not stat.S_ISDIR(recheck.st_mode):
-                        raise
-            return MaterializationResult(Path(targetpath), 0, already_dir)
-        if os.path.lexists(targetpath) and os.path.islink(targetpath):
-            raise ExtractionSecurityError(
-                "Refusing to traverse symlinked extraction directory"
-            )
-        existed = os.path.isdir(targetpath)
-        if not existed:
-            try:
-                os.mkdir(targetpath)
-            except FileExistsError:
-                if not os.path.isdir(targetpath):
-                    raise
-        return MaterializationResult(Path(targetpath), 0, existed)
-
-    def _materialize_symlink(self, params: MaterializeParams) -> MaterializationResult:
-        member, targetpath, dir_fd = params.member, params.targetpath, params.dir_fd
-        with self.open(member, pwd=params.pwd) as source:
-            link_target = os.fsdecode(source.read())
-        if os.path.isabs(link_target) or ".." in link_target.replace("\\", "/").split(
-            "/"
-        ):
-            raise ExtractionSecurityError(
-                "Refusing to create symlink outside extraction root"
-            )
-        if dir_fd is not None and os.symlink in os.supports_dir_fd:
-            name = os.path.basename(targetpath)
-            try:
-                os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-                existed = True
-            except FileNotFoundError:
-                existed = False
-            if existed:
-                os.unlink(name, dir_fd=dir_fd)
-            os.symlink(link_target, name, dir_fd=dir_fd)
-            return MaterializationResult(Path(targetpath), 0, existed)
-        existed = os.path.lexists(targetpath)
-        if existed:
-            os.unlink(targetpath)
-        os.symlink(link_target, targetpath)
-        return MaterializationResult(Path(targetpath), 0, existed)
-
-    def _materialize_special(self, params: MaterializeParams) -> MaterializationResult:
-        member, targetpath = params.member, params.targetpath
-        # ponytail: no dir_fd path for FIFO creation (os.mkfifo lacks a
-        # dir_fd parameter; os.mknod's dir_fd support is Linux-only and
-        # unconfirmed on this platform). Residual TOCTOU window between the
-        # guarded parent walk and this path-based mkfifo call. Upgrade:
-        # hasattr(os, "mknod") and os.mknod in os.supports_dir_fd, if needed.
-        if stat.S_ISFIFO(_entry_mode(member)) and hasattr(os, "mkfifo"):
-            existed = os.path.lexists(targetpath)
-            if existed:
-                os.unlink(targetpath)
-            os.mkfifo(targetpath, stat.S_IMODE(member.external_attr >> 16))
-            return MaterializationResult(Path(targetpath), 0, existed)
-        raise ExtractionMaterializationError("Unsupported special file type")
-
-    def _copy_member_into(self, params: MaterializeParams, target: IO[bytes]) -> None:
-        quota_member_limit, quota_total_limit = (
-            params.quota_member_limit,
-            params.quota_total_limit,
+        return materialize_member(
+            member,
+            targetpath,
+            lambda: self.open(member, pwd=pwd),
+            destination,
+            quota,
+            fsync=fsync,
         )
-        with self.open(params.member, pwd=params.pwd) as source:
-            if quota_member_limit is None and quota_total_limit is None:
-                shutil.copyfileobj(source, target)
-            else:
-                quota_target = _ExtractionQuotaWriter(
-                    target,
-                    member_limit=quota_member_limit,
-                    total_limit=quota_total_limit,
-                    total_written=params.quota_total_written,
-                )
-                shutil.copyfileobj(source, quota_target)
 
-    def _materialize_regular_file(
-        self, params: MaterializeParams
-    ) -> MaterializationResult:
-        targetpath, dir_fd = params.targetpath, params.dir_fd
-        if (
-            dir_fd is not None
-            and os.open in os.supports_dir_fd
-            and os.rename in os.supports_dir_fd
-        ):
-            name = os.path.basename(targetpath)
-            try:
-                os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
-                existed = True
-            except FileNotFoundError:
-                existed = False
-            temp_name: str | None = None
-            bytes_written = 0
-            try:
-                temp_name, fd = _open_unique_temp_fd(dir_fd)
-                with os.fdopen(fd, "wb") as target:
-                    self._copy_member_into(params, target)
-                    target.flush()
-                    os.fsync(target.fileno())
-                    bytes_written = target.tell()
-                os.rename(temp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
-                temp_name = None
-            finally:
-                if temp_name is not None:
-                    try:
-                        os.unlink(temp_name, dir_fd=dir_fd)
-                    except FileNotFoundError:
-                        pass
-            return MaterializationResult(Path(targetpath), bytes_written, existed)
+    def _mark_modified(self) -> None:
+        """Record that the central directory must be rewritten on close."""
+        self._did_modify = True
 
-        existed = os.path.lexists(targetpath)
-        path_temp_name: str | None = None
-        bytes_written = 0
-        try:
-            with tempfile.NamedTemporaryFile(
-                mode="wb", dir=params.directory, prefix=".ziplet-", delete=False
-            ) as target:
-                path_temp_name = target.name
-                self._copy_member_into(params, target)
-                target.flush()
-                os.fsync(target.fileno())
-                bytes_written = target.tell()
-            os.replace(path_temp_name, targetpath)
-            path_temp_name = None
-        finally:
-            if path_temp_name is not None:
-                try:
-                    os.unlink(path_temp_name)
-                except FileNotFoundError:
-                    pass
+    def _add_entry(self, zinfo: ZipInfo) -> None:
+        """Register a fully written entry in the in-memory directory."""
+        self.filelist.append(zinfo)
+        self.NameToInfo[zinfo.filename] = zinfo
 
-        return MaterializationResult(Path(targetpath), bytes_written, existed)
-
-    @staticmethod
-    def _secure_mkdirs(path: str) -> int | None:
-        """Create parents without following pre-existing symlink components.
-
-        Returns an open ``dir_fd`` for the final directory when the
-        platform supports ``dir_fd``-relative operations, ``None``
-        otherwise. The caller owns the returned descriptor and must close
-        it, which keeps the guard alive through the caller's own leaf
-        write instead of closing it beforehand.
-        """
-        absolute = Path(os.path.abspath(path))
-        root = SecureExtractionRoot(Path(absolute.anchor or os.path.sep))
-        relative = tuple(part for part in absolute.parts[1:] if part)
-        with root:
-            parent = root.ensure_parents(relative)
-            return root.open_leaf_parent(parent)
-
-    def _writecheck(self, zinfo: ZipInfo) -> None:
+    def _check_writable(self, zinfo: ZipInfo) -> None:
         """Validate that *zinfo* can be written to the archive.
 
         Issues a warning for duplicate names and raises on invalid archive
@@ -2038,7 +996,7 @@ class ZipFile:
         if not self.fp:
             raise ValueError("Attempt to write ZIP archive that was already closed")
         self._compression_registry.check_compression(zinfo.compress_type)
-        if not self._allowZip64:
+        if not self._allow_zip64:
             requires_zip64 = None
             if len(self.filelist) >= ZIP_FILECOUNT_LIMIT:
                 requires_zip64 = "Files count"
@@ -2051,8 +1009,8 @@ class ZipFile:
 
     def write(
         self,
-        filename: _StrPath,
-        arcname: _StrPath | None = None,
+        filename: StrPath,
+        arcname: StrPath | None = None,
         compress_type: int | None = None,
         compresslevel: int | None = None,
         *,
@@ -2076,11 +1034,7 @@ class ZipFile:
         """
         if not self.fp:
             raise ValueError("Attempt to write to ZIP archive that was already closed")
-        self._write_coordinator.ensure_readable()
-        if self._write_coordinator.active:
-            raise ValueError(
-                "Can't write to ZIP archive while an open writing handle exists"
-            )
+        self._write_coordinator.ensure_writable()
 
         zinfo = ZipInfo.from_file(
             filename, arcname, strict_timestamps=self._strict_timestamps
@@ -2114,7 +1068,7 @@ class ZipFile:
                     extra=extra,
                 ) as dest,
             ):
-                shutil.copyfileobj(src, dest, 1024 * 8)
+                shutil.copyfileobj(src, dest)
 
     def writestr(
         self,
@@ -2152,10 +1106,7 @@ class ZipFile:
 
         if not self.fp:
             raise ValueError("Attempt to write to ZIP archive that was already closed")
-        if self._write_coordinator.active:
-            raise ValueError(
-                "Can't write to ZIP archive while an open writing handle exists."
-            )
+        self._write_coordinator.ensure_writable()
 
         if compress_type is not None:
             zinfo.compress_type = compress_type
@@ -2216,11 +1167,10 @@ class ZipFile:
             if zinfo.compress_type == ZIP_LZMA:
                 zinfo.flag_bits |= MASK_COMPRESS_OPTION_1
 
-            self._writecheck(zinfo)
-            self._didModify = True
+            self._check_writable(zinfo)
+            self._mark_modified()
 
-            self.filelist.append(zinfo)
-            self.NameToInfo[zinfo.filename] = zinfo
+            self._add_entry(zinfo)
             self.fp.write(zinfo.FileHeader(False))
             self.start_dir = self.fp.tell()
 
@@ -2254,7 +1204,7 @@ class ZipFile:
             )
 
         try:
-            if self.mode in ("w", "x", "a") and self._didModify:
+            if self.mode in ("w", "x", "a") and self._did_modify:
                 with self._lock:
                     if self._seekable:
                         self.fp.seek(self.start_dir)
@@ -2265,75 +1215,22 @@ class ZipFile:
             self._fpclose(fp)
 
     def _write_end_record(self) -> None:
-        """Write the central directory and end-of-central-directory record.
+        """Write the central directory and end records, then flush.
 
-        Serialises every :class:`~ziplet.zipfile.info.ZipInfo` in
-        :attr:`filelist` into central directory entries, emits a ZIP64 end
-        record and locator when required, and finalises with the standard
-        end-of-central-directory record and the archive comment. Truncates
-        the file afterwards when mode is ``'a'``.
+        Truncates the file afterwards in append mode, since the new directory
+        may be shorter than the one it replaced.
 
         Raises:
-            LargeZipFile: If central directory metrics exceed ZIP64 thresholds
-                and ZIP64 is not allowed.
+            LargeZipFile: If ZIP64 is required but not allowed.
         """
         assert self.fp is not None
-        parts: list[bytes] = []
-        for zinfo in self.filelist:
-            centdir, filename, extra_data = zinfo.central_directory()
-            parts.extend((centdir, filename, extra_data, zinfo.comment))
-        self.fp.write(b"".join(parts))
-
-        pos2 = self.fp.tell()
-        centDirCount = len(self.filelist)
-        centDirSize = pos2 - self.start_dir
-        centDirOffset = self.start_dir
-        requires_zip64 = None
-        if centDirCount > ZIP_FILECOUNT_LIMIT:
-            requires_zip64 = "Files count"
-        elif centDirOffset > ZIP64_LIMIT:
-            requires_zip64 = "Central directory offset"
-        elif centDirSize > ZIP64_LIMIT:
-            requires_zip64 = "Central directory size"
-        if requires_zip64:
-            if not self._allowZip64:
-                raise LargeZipFile(requires_zip64 + " would require ZIP64 extensions")
-            zip64endrec = struct.pack(
-                structEndArchive64,
-                stringEndArchive64,
-                sizeEndCentDir64 - 12,
-                45,
-                45,
-                0,
-                0,
-                centDirCount,
-                centDirCount,
-                centDirSize,
-                centDirOffset,
-            )
-            self.fp.write(zip64endrec)
-
-            zip64locrec = struct.pack(
-                structEndArchive64Locator, stringEndArchive64Locator, 0, pos2, 1
-            )
-            self.fp.write(zip64locrec)
-            centDirCount = min(centDirCount, 0xFFFF)
-            centDirSize = min(centDirSize, 0xFFFFFFFF)
-            centDirOffset = min(centDirOffset, 0xFFFFFFFF)
-
-        endrec = struct.pack(
-            structEndArchive,
-            stringEndArchive,
-            0,
-            0,
-            centDirCount,
-            centDirCount,
-            centDirSize,
-            centDirOffset,
-            len(self._comment),
+        write_directory(
+            self.fp,
+            self.filelist,
+            self.start_dir,
+            self._comment,
+            allow_zip64=self._allow_zip64,
         )
-        self.fp.write(endrec)
-        self.fp.write(self._comment)
         if self.mode == "a":
             self.fp.truncate()
         self.fp.flush()
@@ -2344,7 +1241,7 @@ class ZipFile:
         Args:
             fp: The binary file object to (conditionally) close.
         """
-        assert self._fileRefCnt > 0
-        self._fileRefCnt -= 1
-        if not self._fileRefCnt and not self._filePassed:
+        assert self._file_ref_cnt > 0
+        self._file_ref_cnt -= 1
+        if not self._file_ref_cnt and not self._file_passed:
             fp.close()

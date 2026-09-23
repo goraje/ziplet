@@ -1,4 +1,7 @@
-"""Exceptions raised by policy-enabled extraction operations."""
+"""Exceptions raised by extraction and its filesystem materialization.
+
+Standard-library-compatible exceptions live in :mod:`ziplet.exceptions`.
+"""
 
 from __future__ import annotations
 

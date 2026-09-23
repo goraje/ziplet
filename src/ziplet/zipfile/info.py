@@ -29,7 +29,11 @@ from ziplet.cryptography import (
 from ziplet.cryptography.aes import EXTRA_WZ_AES, WZ_AES_COMPRESS_TYPE
 from ziplet.exceptions import BadZipFile, LargeZipFile
 from ziplet.zipfile.shared import (
+    CENTRAL_DIR_SIGNATURE,
+    CENTRAL_DIR_STRUCT,
     DEFAULT_VERSION,
+    FILE_HEADER_SIGNATURE,
+    FILE_HEADER_STRUCT,
     MASK_COMPRESSED_PATCH,
     MASK_ENCRYPTED,
     MASK_STRONG_ENCRYPTION,
@@ -37,10 +41,6 @@ from ziplet.zipfile.shared import (
     MASK_UTF_FILENAME,
     ZIP64_LIMIT,
     ZIP64_VERSION,
-    stringCentralDir,
-    stringFileHeader,
-    structCentralDir,
-    structFileHeader,
 )
 
 # ---------------------------------------------------------------------------
@@ -52,7 +52,7 @@ from ziplet.zipfile.shared import (
 class WzAesExtra:
     """AES extra-field metadata stored on a ``ZipInfo`` instance.
 
-    Populated automatically by ``ZipInfo._decodeExtra`` when the 0x9901
+    Populated automatically by ``ZipInfo._decode_extra`` when the 0x9901
     extra field is present, or supplied explicitly via
     ``ZipInfo.__init__(aes_extra=...)``.  All fields default to ``None``
     for non-AES entries.
@@ -186,7 +186,7 @@ class ZipInfo:
     Instances are created directly or via ``ZipInfo.from_file``, and are
     populated by ``ZipFile`` when reading an archive. Most attributes are set
     from the central directory record; ``header_offset``, ``CRC``, and
-    ``_raw_time`` are set externally by ``ZipFile`` after parsing.
+    ``raw_time`` are set externally by ``ZipFile`` after parsing.
 
     Attributes:
         orig_filename: Filename exactly as stored in the ZIP record.
@@ -214,7 +214,7 @@ class ZipInfo:
     # Annotate slots that are set externally (by ZipFile) rather than in __init__
     CRC: int
     header_offset: int
-    _raw_time: int
+    raw_time: int
     _end_offset: int | None
     aes_extra: WzAesExtra
 
@@ -238,7 +238,7 @@ class ZipInfo:
         "CRC",
         "compress_size",
         "file_size",
-        "_raw_time",
+        "raw_time",
         "_end_offset",
         "aes_extra",
     )
@@ -296,7 +296,7 @@ class ZipInfo:
         # Other attributes are set by class ZipFile:
         # header_offset         Byte offset to the file header
         # CRC                   CRC-32 of the uncompressed file
-        # AES extra-field metadata; populated by _decodeExtra
+        # AES extra-field metadata; populated by _decode_extra
         # or supplied via aes_extra param
         self.aes_extra: WzAesExtra = (
             aes_extra if aes_extra is not None else WzAesExtra()
@@ -417,8 +417,9 @@ class ZipInfo:
         Returns:
             Packed data descriptor including the ``PK\x07\x08`` signature.
         """
+        _, crc, _ = self._encode_extra(self.CRC, self.compress_type)
         return self.encode_data_descriptor(
-            zip64, self.CRC, self.compress_size, self.file_size
+            zip64, crc, self.compress_size, self.file_size
         )
 
     def encode_datadescripter(
@@ -431,7 +432,7 @@ class ZipInfo:
         """Compatibility alias for the historical misspelled method."""
         return self.data_descriptor(zip64)
 
-    def zip64_local_header(
+    def _zip64_local_extra(
         self, zip64: bool | None, file_size: int, compress_size: int
     ) -> tuple[bytes, int, int, int]:
         """Compute the ZIP64 extra field and placeholder sizes for a local file header.
@@ -473,7 +474,7 @@ class ZipInfo:
             min_version = ZIP64_VERSION
         return extra, file_size, compress_size, min_version
 
-    def zip64_central_header(self) -> tuple[bytes, int, int, int, int]:
+    def _zip64_central_extra(self) -> tuple[bytes, int, int, int, int]:
         """Build the ZIP64 extra field bytes for a central directory entry.
 
         Any existing extra data on ``self.extra`` is preserved; a stale ZIP64
@@ -521,7 +522,7 @@ class ZipInfo:
         extra_data = zip64_extra + existing_extra
         return extra_data, file_size, compress_size, header_offset, min_version
 
-    def minimum_version(self, zip64_version: int = 0) -> int:
+    def _minimum_version(self, zip64_version: int = 0) -> int:
         """Return the minimum ZIP version required by this entry."""
         versions = {
             ZIP_BZIP2: BZIP2_VERSION,
@@ -530,7 +531,7 @@ class ZipInfo:
         }
         return max(zip64_version, versions.get(self.compress_type, 0))
 
-    def encode_extra(self, crc: int, compress_type: int) -> tuple[bytes, int, int]:
+    def _encode_extra(self, crc: int, compress_type: int) -> tuple[bytes, int, int]:
         """Encode the WinZip AES extra field and adjust CRC and compression type.
 
         When ``aes_extra.wz_aes_vendor_id`` is ``None`` (non-AES entry) this
@@ -572,7 +573,7 @@ class ZipInfo:
             )
         return wz_aes_extra, crc, compress_type
 
-    def encode_local_header(
+    def _encode_local_header(
         self,
         *,
         filename: bytes,
@@ -608,11 +609,11 @@ class ZipInfo:
         Returns:
             Packed local file header followed by *filename* and *extra* bytes.
         """
-        wz_aes_extra, crc, compress_type = self.encode_extra(crc, compress_type)
+        wz_aes_extra, crc, compress_type = self._encode_extra(crc, compress_type)
         extra = extra + wz_aes_extra
         header = struct.pack(
-            structFileHeader,
-            stringFileHeader,
+            FILE_HEADER_STRUCT,
+            FILE_HEADER_SIGNATURE,
             extract_version,
             reserved,
             flag_bits,
@@ -627,7 +628,7 @@ class ZipInfo:
         )
         return header + filename + extra
 
-    def encode_central_directory(
+    def _encode_central_directory(
         self,
         *,
         filename: bytes,
@@ -677,11 +678,11 @@ class ZipInfo:
         Returns:
             A tuple of ``(centdir_bytes, filename_bytes, extra_data_bytes)``.
         """
-        wz_aes_extra, crc, compress_type = self.encode_extra(crc, compress_type)
+        wz_aes_extra, crc, compress_type = self._encode_extra(crc, compress_type)
         extra_data = extra_data + wz_aes_extra
         centdir = struct.pack(
-            structCentralDir,
-            stringCentralDir,
+            CENTRAL_DIR_STRUCT,
+            CENTRAL_DIR_SIGNATURE,
             create_version,
             create_system,
             extract_version,
@@ -708,7 +709,7 @@ class ZipInfo:
 
         Computes the minimum required ZIP specification version from the
         compression type and ZIP64 requirements, then delegates to
-        ``encode_central_directory``.
+        ``_encode_central_directory``.
 
         Returns:
             A tuple of ``(centdir_bytes, filename_bytes, extra_data_bytes)``
@@ -722,16 +723,16 @@ class ZipInfo:
             compress_size,
             header_offset,
             min_version,
-        ) = self.zip64_central_header()
+        ) = self._zip64_central_extra()
 
-        min_version = self.minimum_version(min_version)
+        min_version = self._minimum_version(min_version)
 
         extract_version = max(min_version, self.extract_version)
         create_version = max(min_version, self.create_version)
-        filename, flag_bits = self._encodeFilenameFlags()
+        filename, flag_bits = self._encode_filename_flags()
         # Writing multi-disk archives is not supported so disk_start is always 0
         disk_start = 0
-        return self.encode_central_directory(
+        return self._encode_central_directory(
             filename=filename,
             create_version=create_version,
             create_system=self.create_system,
@@ -755,9 +756,8 @@ class ZipInfo:
     def FileHeader(self, zip64: bool | None = None) -> bytes:
         """Serialize the local file header for this entry.
 
-        Also updates ``extract_version`` and ``create_version`` on ``self`` to
-        reflect any minimum version requirements imposed by ZIP64 or the
-        compression type.
+        The effective ``extract_version`` accounts for ZIP64 and the
+        compression type but is not written back to ``self``.
 
         Args:
             zip64: Force ZIP64 on (``True``), off (``False``), or auto-detect
@@ -770,7 +770,7 @@ class ZipInfo:
         """
         dosdate = self.get_dosdate()
         dostime = self.get_dostime()
-        if self.use_datadescripter:
+        if self.use_data_descriptor:
             # Set these to zero because we write them after the file data
             CRC = compress_size = file_size = 0
         else:
@@ -779,16 +779,16 @@ class ZipInfo:
             file_size = self.file_size
 
         min_version = 0
-        extra, file_size, compress_size, zip64_min_version = self.zip64_local_header(
+        extra, file_size, compress_size, zip64_min_version = self._zip64_local_extra(
             zip64, file_size, compress_size
         )
         min_version = max(min_version, zip64_min_version)
 
-        min_version = self.minimum_version(min_version)
+        min_version = self._minimum_version(min_version)
 
         extract_version = max(min_version, self.extract_version)
-        filename, flag_bits = self._encodeFilenameFlags()
-        return self.encode_local_header(
+        filename, flag_bits = self._encode_filename_flags()
+        return self._encode_local_header(
             filename=filename,
             extract_version=extract_version,
             reserved=self.reserved,
@@ -802,7 +802,7 @@ class ZipInfo:
             extra=extra,
         )
 
-    def _encodeFilenameFlags(self) -> tuple[bytes, int]:
+    def _encode_filename_flags(self) -> tuple[bytes, int]:
         """Encode the filename and determine the UTF-8 flag.
 
         Attempts ASCII encoding first; falls back to UTF-8 and sets
@@ -817,7 +817,7 @@ class ZipInfo:
         except UnicodeEncodeError:
             return self.filename.encode("utf-8"), self.flag_bits | MASK_UTF_FILENAME
 
-    def get_extra_decoders(self) -> dict[int, Callable[..., None]]:
+    def _extra_decoders(self) -> dict[int, Callable[..., None]]:
         """Return a mapping of extra-field tag to decoder method.
 
         Subclasses may override this to register additional decoders for
@@ -828,11 +828,11 @@ class ZipInfo:
             method responsible for decoding that field.
         """
         return {
-            _EXTRA_ZIP64: self.decode_extra_zip64,
-            EXTRA_WZ_AES: self.decode_extra_wz_aes,
+            _EXTRA_ZIP64: self._decode_zip64_extra,
+            EXTRA_WZ_AES: self._decode_wz_aes_extra,
         }
 
-    def decode_extra_zip64(
+    def _decode_zip64_extra(
         self, ln: int, extra: bytes, is_central_directory: bool = True
     ) -> None:
         """Decode a ZIP64 extended information extra field (tag 0x0001).
@@ -874,7 +874,7 @@ class ZipInfo:
         except struct.error:
             raise BadZipFile(f"Corrupt zip64 extra field. {field} not found.") from None
 
-    def decode_extra_wz_aes(self, ln: int, extra: bytes) -> None:
+    def _decode_wz_aes_extra(self, ln: int, extra: bytes) -> None:
         """Decode a WinZip AES extra field (tag 0x9901).
 
         Populates ``aes_extra.wz_aes_version``, ``aes_extra.wz_aes_vendor_id``,
@@ -903,11 +903,11 @@ class ZipInfo:
         if self.aes_extra.wz_aes_strength not in (1, 2, 3):
             raise BadZipFile("Invalid WinZip AES strength")
 
-    def _decodeExtra(self, filename_crc: int) -> None:
+    def _decode_extra(self, filename_crc: int) -> None:
         """Parse the extra-data block and update ``self`` with decoded field values.
 
         Iterates over every extra field in ``self.extra`` and dispatches to the
-        appropriate decoder returned by ``get_extra_decoders``. The Unicode
+        appropriate decoder returned by ``_extra_decoders``. The Unicode
         Path extra field (0x7075) is handled inline because it requires the
         *filename_crc* context. Unknown tags are silently ignored.
 
@@ -922,7 +922,7 @@ class ZipInfo:
         # Try to decode the extra field.
         extra = self.extra
         unpack = struct.unpack
-        extra_decoders = self.get_extra_decoders()
+        extra_decoders = self._extra_decoders()
         while len(extra) >= 4:
             tp, ln = unpack("<HH", extra[:4])
             if ln + 4 > len(extra):

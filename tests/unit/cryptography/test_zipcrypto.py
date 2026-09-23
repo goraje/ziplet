@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -9,6 +10,7 @@ from ziplet.cryptography.zipcrypto import (
     ZipCryptoDecrypter,
     ZipCryptoEncryptor,
     _gen_crc,
+    _ZipCryptoState,
 )
 from ziplet.zipfile.shared import MASK_USE_DATA_DESCRIPTOR
 
@@ -31,15 +33,15 @@ def _make_enc_header(
 
 def _make_dec_zinfo(
     *,
-    use_datadescripter: bool = True,
+    use_data_descriptor: bool = True,
     raw_time: int = 0x5A3C,
     crc: int = 0,
     filename: str = "test.txt",
 ) -> MagicMock:
     zinfo = MagicMock()
     zinfo.filename = filename
-    zinfo.use_datadescripter = use_datadescripter
-    zinfo._raw_time = raw_time
+    zinfo.use_data_descriptor = use_data_descriptor
+    zinfo.raw_time = raw_time
     zinfo.CRC = crc
     return zinfo
 
@@ -87,34 +89,34 @@ class TestGenCrc:
 class TestZipCryptoEncryptor:
     def test_initial_key_state_with_empty_password(self) -> None:
         enc = ZipCryptoEncryptor(b"")
-        assert enc.key0 == 305419896
-        assert enc.key1 == 591751049
-        assert enc.key2 == 878082192
+        assert enc._state.key0 == 305419896
+        assert enc._state.key1 == 591751049
+        assert enc._state.key2 == 878082192
 
     def test_password_changes_key_state(self) -> None:
         empty = ZipCryptoEncryptor(b"")
         with_pwd = ZipCryptoEncryptor(b"password")
         # At least one key must differ
         assert (
-            empty.key0 != with_pwd.key0
-            or empty.key1 != with_pwd.key1
-            or empty.key2 != with_pwd.key2
+            empty._state.key0 != with_pwd._state.key0
+            or empty._state.key1 != with_pwd._state.key1
+            or empty._state.key2 != with_pwd._state.key2
         )
 
     def test_same_passwords_produce_same_key_state(self) -> None:
         enc1 = ZipCryptoEncryptor(b"same")
         enc2 = ZipCryptoEncryptor(b"same")
-        assert enc1.key0 == enc2.key0
-        assert enc1.key1 == enc2.key1
-        assert enc1.key2 == enc2.key2
+        assert enc1._state.key0 == enc2._state.key0
+        assert enc1._state.key1 == enc2._state.key1
+        assert enc1._state.key2 == enc2._state.key2
 
     def test_crc32_returns_int(self) -> None:
         enc = ZipCryptoEncryptor(b"pw")
-        assert isinstance(enc.crc32(0x41, 0x12345678), int)
+        assert isinstance(enc._state.crc32(0x41, 0x12345678), int)
 
     def test_crc32_result_fits_32_bits(self) -> None:
         enc = ZipCryptoEncryptor(b"pw")
-        result = enc.crc32(0xFF, 0xFFFFFFFF)
+        result = enc._state.crc32(0xFF, 0xFFFFFFFF)
         assert 0 <= result <= 0xFFFFFFFF
 
     def test_encrypt_returns_bytes(self) -> None:
@@ -178,9 +180,9 @@ class TestZipCryptoDecrypter:
     def test_valid_password_via_datadescriptor(self) -> None:
         dos_time = 0x5A3C
         _, header = _make_enc_header(b"correct", dos_time)
-        zinfo = _make_dec_zinfo(use_datadescripter=True, raw_time=dos_time)
+        zinfo = _make_dec_zinfo(use_data_descriptor=True, raw_time=dos_time)
         dec = ZipCryptoDecrypter(zinfo, b"correct", header)
-        assert dec.key0 is not None
+        assert dec._state.key0 is not None
 
     def test_wrong_password_raises_runtime_error(self) -> None:
         dos_time = 0x5A3C
@@ -191,12 +193,12 @@ class TestZipCryptoDecrypter:
             "ziplet.cryptography.zipcrypto.os.urandom", return_value=b"\x00" * 11
         ):
             _, header = _make_enc_header(b"correct", dos_time)
-        zinfo = _make_dec_zinfo(use_datadescripter=True, raw_time=dos_time)
+        zinfo = _make_dec_zinfo(use_data_descriptor=True, raw_time=dos_time)
         with pytest.raises(RuntimeError, match="Bad password"):
             ZipCryptoDecrypter(zinfo, b"wrong", header)
 
     def test_valid_password_via_crc(self) -> None:
-        """Password check using the CRC MSB (use_datadescripter=False)."""
+        """Password check using the CRC MSB (use_data_descriptor=False)."""
         pwd = b"crctest"
         crc = 0xAB000000
         check_byte = (crc >> 24) & 0xFF  # 0xAB
@@ -207,7 +209,7 @@ class TestZipCryptoDecrypter:
         raw_header = bytes(range(11)) + bytes([check_byte])
         encrypted_header = enc.encrypt(raw_header)
 
-        zinfo = _make_dec_zinfo(use_datadescripter=False, crc=crc)
+        zinfo = _make_dec_zinfo(use_data_descriptor=False, crc=crc)
         # Must not raise
         ZipCryptoDecrypter(zinfo, pwd, encrypted_header)
 
@@ -216,7 +218,7 @@ class TestZipCryptoDecrypter:
         _, header = _make_enc_header(b"pw", dos_time)
         zinfo = _make_dec_zinfo(raw_time=dos_time)
         dec = ZipCryptoDecrypter(zinfo, b"pw", header)
-        assert isinstance(dec.crc32(0x41, 0x12345678), int)
+        assert isinstance(dec._state.crc32(0x41, 0x12345678), int)
 
     def test_decrypt_returns_bytes(self) -> None:
         dos_time = 0x3C00
@@ -269,3 +271,38 @@ class TestZipCryptoDecrypter:
         dec_zinfo = _make_dec_zinfo(raw_time=dos_time)
         dec = ZipCryptoDecrypter(dec_zinfo, b"multitest", header)
         assert dec.decrypt(ciphertext) == plaintext
+
+
+# ---------------------------------------------------------------------------
+# Inlined key schedule must match the straightforward per-byte definition
+# ---------------------------------------------------------------------------
+
+
+def _reference_encrypt(pwd: bytes, data: bytes) -> bytes:
+    state = _ZipCryptoState(pwd)
+    out = bytearray()
+    for value in data:
+        key = state.key2 | 2
+        stream_byte = ((key * (key ^ 1)) >> 8) & 0xFF
+        state.update_keys(value)
+        out.append(value ^ stream_byte)
+    return bytes(out)
+
+
+def test_encrypt_matches_reference_and_decrypt_inverts_it() -> None:
+    data = bytes(range(256)) * 5
+    ciphertext = _ZipCryptoState(b"secret").encrypt(data)
+    assert ciphertext == _reference_encrypt(b"secret", data)
+    assert _ZipCryptoState(b"secret").decrypt(ciphertext) == data
+
+
+def test_state_carries_over_between_chunks() -> None:
+    data = os.urandom(1000)
+    whole = _ZipCryptoState(b"pw").encrypt(data)
+    chunked = _ZipCryptoState(b"pw")
+    assert (
+        chunked.encrypt(data[:1])
+        + chunked.encrypt(data[1:700])
+        + chunked.encrypt(data[700:])
+        == whole
+    )

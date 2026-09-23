@@ -9,10 +9,6 @@ from ziplet.cryptography.aes import AesZipDecrypter
 from ziplet.cryptography.zipcrypto import ZipCryptoDecrypter
 from ziplet.zipfile.ext import ZipExtFile
 from ziplet.zipfile.info import WzAesExtra, ZipInfo
-from ziplet.zipfile.shared import (
-    MASK_COMPRESSED_PATCH,
-    MASK_STRONG_ENCRYPTION,
-)
 
 
 def _make_ext() -> ZipExtFile:
@@ -20,26 +16,6 @@ def _make_ext() -> ZipExtFile:
     ext._close_fileobj = False
     ext._fileobj = cast(Any, io.BytesIO())
     return ext
-
-
-class TestZipExtFileUnsupportedFlags:
-    def test_compressed_patch_flag_raises(self) -> None:
-        ext = _make_ext()
-        zinfo = ZipInfo("f.txt")
-        zinfo.flag_bits |= MASK_COMPRESSED_PATCH
-        ext._zinfo = zinfo
-
-        with pytest.raises(NotImplementedError, match="compressed patched"):
-            ext.raise_for_unsupported_flags()
-
-    def test_strong_encryption_flag_raises(self) -> None:
-        ext = _make_ext()
-        zinfo = ZipInfo("f.txt")
-        zinfo.flag_bits |= MASK_STRONG_ENCRYPTION
-        ext._zinfo = zinfo
-
-        with pytest.raises(NotImplementedError, match="strong encryption"):
-            ext.raise_for_unsupported_flags()
 
 
 class TestZipExtFileSetupDecrypter:
@@ -52,7 +28,7 @@ class TestZipExtFileSetupDecrypter:
         ext.name = "secret.txt"
 
         with pytest.raises(RuntimeError, match="requires a password"):
-            ext.setup_decrypter()
+            ext._setup_decrypter()
 
     def test_zipcrypto_missing_password_raises(self) -> None:
         ext = _make_ext()
@@ -63,7 +39,7 @@ class TestZipExtFileSetupDecrypter:
         ext.name = "secret.txt"
 
         with pytest.raises(RuntimeError, match="password required"):
-            ext.setup_decrypter()
+            ext._setup_decrypter()
 
     def test_aes_branch_reads_header_and_subtracts_hmac(self) -> None:
         ext = _make_ext()
@@ -75,7 +51,7 @@ class TestZipExtFileSetupDecrypter:
         ext._fileobj = cast(Any, io.BytesIO(b"x" * 128))
         ext._orig_compress_left = 100
 
-        cls = ext.setup_decrypter()
+        cls = ext._setup_decrypter()
 
         header_len = AesZipDecrypter.encryption_header_length(ext._zinfo)
         assert cls is AesZipDecrypter
@@ -92,7 +68,7 @@ class TestZipExtFileSetupDecrypter:
         ext._fileobj = cast(Any, io.BytesIO(b"x" * 64))
         ext._orig_compress_left = 80
 
-        cls = ext.setup_decrypter()
+        cls = ext._setup_decrypter()
 
         assert cls is ZipCryptoDecrypter
         assert len(ext.encryption_header) == ZipCryptoDecrypter.encryption_header_length
@@ -105,6 +81,6 @@ class TestZipExtFileSetupDecrypter:
         ext._pwd = b"pw"
         ext.encryption_header = b"header"
 
-        kwargs = ext.get_decrypter_kwargs()
+        kwargs = ext._decrypter_kwargs()
 
         assert kwargs == {"pwd": b"pw", "encryption_header": b"header"}

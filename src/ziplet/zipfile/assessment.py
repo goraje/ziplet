@@ -4,12 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 from ziplet.zipfile.extract import ExtractPolicy, ExtractViolation, MemberAssessment
-
-if TYPE_CHECKING:
-    pass
 
 
 @dataclass(frozen=True)
@@ -44,11 +40,3 @@ class ArchiveAssessment:
     total_uncompressed_size: int
     duplicate_member_names: tuple[str, ...]
     duplicate_targets: tuple[Path, ...]
-
-
-@dataclass(frozen=True)
-class ExtractionTarget:
-    """A normalized filesystem target and its archive-relative components."""
-
-    path: Path
-    parts: tuple[str, ...]

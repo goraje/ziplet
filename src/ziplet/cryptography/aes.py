@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import hmac as stdlib_hmac
 import os
+import sys
+from array import array
 from typing import TYPE_CHECKING
 
 from cryptography.hazmat.primitives import hashes, hmac
@@ -53,19 +55,45 @@ _PWD_VERIFY_LENGTH = 2
 _NBITS_TO_STRENGTH: dict[int, int] = {128: 1, 192: 2, 256: 3}
 
 
+_BLOCK_SIZE = 16
+
+
+def _counter_blocks(start: int, count: int) -> bytes:
+    """Return *count* consecutive 128-bit little-endian counter blocks.
+
+    Block ``i`` is the integer ``start + i`` in little-endian byte order. The
+    counter never approaches 2**64 (that would be 256 EiB of data), so each
+    block is a 64-bit word followed by a zero word.
+    """
+    words = array("Q", bytes(_BLOCK_SIZE * count))
+    words[0::2] = array("Q", range(start, start + count))
+    if sys.byteorder == "big":  # pragma: no cover - little-endian CI hosts
+        words.byteswap()
+    return words.tobytes()
+
+
+def _xor(data: bytes, keystream: bytes) -> bytes:
+    """XOR two equal-length byte strings using C-speed big-integer arithmetic."""
+    return (
+        int.from_bytes(data, "little") ^ int.from_bytes(keystream, "little")
+    ).to_bytes(len(data), "little")
+
+
 class _AesCtrWithLittleEndian:
-    """AES-CTR cipher with a little-endian counter.
+    """AES-CTR cipher with the little-endian counter WinZip AES specifies.
 
-    Implements AES-CTR with little-endian counter increments to match
-    pycryptodome's behavior. The cryptography library's CTR mode uses
-    big-endian, so little-endian is implemented manually.
+    Standard CTR implementations (including OpenSSL's) increment the counter
+    block as a big-endian integer, so the keystream is built here from raw
+    AES block encryptions of little-endian counter blocks.  AES itself stays
+    in the ``cryptography`` backend, so a FIPS-configured OpenSSL provider
+    still performs every AES operation.
 
-    Maintains a keystream buffer to handle partial blocks correctly across
-    multiple encrypt/decrypt calls.
+    Whole chunks are processed with one AES call and one big-integer XOR, so
+    the Python-level cost is per chunk rather than per block or per byte.
 
     Attributes:
-        counter (int): Current CTR counter value (starts at 1).
-        keystream_buffer (bytes): Remaining unused bytes from the last keystream block.
+        counter (int): Next counter value to encrypt (starts at 1).
+        keystream_buffer (bytes): Unused bytes left over from the last block.
     """
 
     def __init__(self, key: bytes) -> None:
@@ -75,22 +103,9 @@ class _AesCtrWithLittleEndian:
             key (bytes): AES encryption key. Must be 16, 24, or 32 bytes
                 (128, 192, or 256 bits).
         """
-        self.counter = 1  # Start at 1, matching pycryptodome's default
+        self.counter = 1
         self.keystream_buffer = b""
         self._encryptor = Cipher(algorithms.AES(key), modes.ECB()).encryptor()
-
-    def _get_keystream_block(self) -> bytes:
-        """Generate the next 16-byte keystream block.
-
-        Encrypts the current counter value (little-endian) with AES-ECB
-        and increments the counter.
-
-        Returns:
-            bytes: 16-byte keystream block.
-        """
-        counter_bytes = self.counter.to_bytes(16, byteorder="little")
-        self.counter += 1
-        return self._encryptor.update(counter_bytes)
 
     def encrypt(self, data: bytes) -> bytes:
         """Encrypt data using AES-CTR with a little-endian counter.
@@ -101,29 +116,17 @@ class _AesCtrWithLittleEndian:
         Returns:
             bytes: Ciphertext of the same length as *data*.
         """
-        ciphertext = bytearray()
-        data_idx = 0
-        n = len(data)
-
-        if self.keystream_buffer:
-            use = min(len(self.keystream_buffer), n)
-            ciphertext.extend(
-                a ^ b
-                for a, b in zip(data[:use], self.keystream_buffer[:use], strict=False)
-            )
-            self.keystream_buffer = self.keystream_buffer[use:]
-            data_idx = use
-
-        while data_idx < n:
-            keystream = self._get_keystream_block()
-            chunk = data[data_idx : data_idx + 16]
-            chunk_len = len(chunk)
-            ciphertext.extend(a ^ b for a, b in zip(chunk, keystream, strict=False))
-            if chunk_len < 16:
-                self.keystream_buffer = keystream[chunk_len:]
-            data_idx += chunk_len
-
-        return bytes(ciphertext)
+        size = len(data)
+        if not size:
+            return b""
+        keystream = self.keystream_buffer
+        missing = size - len(keystream)
+        if missing > 0:
+            blocks = -(-missing // _BLOCK_SIZE)
+            keystream += self._encryptor.update(_counter_blocks(self.counter, blocks))
+            self.counter += blocks
+        self.keystream_buffer = keystream[size:]
+        return _xor(data, keystream[:size])
 
     def decrypt(self, data: bytes) -> bytes:
         """Decrypt data using AES-CTR (identical to encryption in CTR mode).

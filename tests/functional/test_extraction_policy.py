@@ -272,3 +272,32 @@ def test_dir_fd_relative_regular_file_replaces_leaf_symlink_without_following(
     assert not (destination / "payload.txt").is_symlink()
     assert (destination / "payload.txt").read_bytes() == b"new-content"
     assert outside.read_bytes() == b"original-outside-content"
+
+
+@pytest.mark.parametrize(("fsync_files", "expected_calls"), [(True, 2), (False, 0)])
+def test_fsync_files_policy_controls_fsync(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    fsync_files: bool,
+    expected_calls: int,
+) -> None:
+    archive = tmp_path / "a.zip"
+    with ziplet.ZipFile(archive, "w") as zf:
+        zf.writestr("one.txt", b"1")
+        zf.writestr("two.txt", b"2")
+    calls: list[int] = []
+    real_fsync = os.fsync
+
+    def recording_fsync(fd: int) -> None:
+        calls.append(fd)
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", recording_fsync)
+
+    with ziplet.ZipFile(archive) as zf:
+        zf.extractall(
+            tmp_path / "out", policy=ziplet.ExtractPolicy(fsync_files=fsync_files)
+        )
+
+    assert len(calls) == expected_calls
+    assert (tmp_path / "out" / "two.txt").read_bytes() == b"2"

@@ -19,14 +19,14 @@ from ziplet.exceptions import LargeZipFile
 from ziplet.zipfile import file as file_mod
 from ziplet.zipfile import info as info_mod
 from ziplet.zipfile.shared import (
-    sizeCentralDir,
-    sizeFileHeader,
-    stringCentralDir,
-    stringEndArchive64,
-    stringEndArchive64Locator,
-    stringFileHeader,
-    structCentralDir,
-    structFileHeader,
+    CENTRAL_DIR_SIGNATURE,
+    CENTRAL_DIR_SIZE,
+    CENTRAL_DIR_STRUCT,
+    END_ARCHIVE64_LOCATOR_SIGNATURE,
+    END_ARCHIVE64_SIGNATURE,
+    FILE_HEADER_SIGNATURE,
+    FILE_HEADER_SIZE,
+    FILE_HEADER_STRUCT,
 )
 
 SZ_EXE = Path(r"C:\Program Files\7-Zip\7z.exe")
@@ -58,23 +58,23 @@ def _parse_extra_has_zip64(extra: bytes) -> bool:
 
 def _first_local_extra(path: Path) -> bytes:
     data = path.read_bytes()
-    off = data.find(stringFileHeader)
+    off = data.find(FILE_HEADER_SIGNATURE)
     assert off >= 0, "local header not found"
-    header = struct.unpack(structFileHeader, data[off : off + sizeFileHeader])
+    header = struct.unpack(FILE_HEADER_STRUCT, data[off : off + FILE_HEADER_SIZE])
     fname_len = header[10]
     extra_len = header[11]
-    start = off + sizeFileHeader + fname_len
+    start = off + FILE_HEADER_SIZE + fname_len
     return data[start : start + extra_len]
 
 
 def _first_central_extra(path: Path) -> bytes:
     data = path.read_bytes()
-    off = data.find(stringCentralDir)
+    off = data.find(CENTRAL_DIR_SIGNATURE)
     assert off >= 0, "central directory not found"
-    cent = struct.unpack(structCentralDir, data[off : off + sizeCentralDir])
+    cent = struct.unpack(CENTRAL_DIR_STRUCT, data[off : off + CENTRAL_DIR_SIZE])
     fname_len = cent[12]
     extra_len = cent[13]
-    start = off + sizeCentralDir + fname_len
+    start = off + CENTRAL_DIR_SIZE + fname_len
     return data[start : start + extra_len]
 
 
@@ -159,8 +159,8 @@ class TestZip64Functional:
             zf.writestr("c.txt", b"c")
 
         raw = path.read_bytes()
-        assert stringEndArchive64 in raw
-        assert stringEndArchive64Locator in raw
+        assert END_ARCHIVE64_SIGNATURE in raw
+        assert END_ARCHIVE64_LOCATOR_SIGNATURE in raw
 
         with ZipFile(path, "r") as zf:
             assert zf.namelist() == ["a.txt", "b.txt", "c.txt"]

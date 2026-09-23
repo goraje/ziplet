@@ -1,10 +1,15 @@
+"""Exceptions mirroring the standard library ``zipfile`` module.
+
+Extraction-policy failures live in :mod:`ziplet.zipfile.exceptions`.
+"""
+
 from __future__ import annotations
 
 __all__ = ["BadZipFile", "LargeZipFile"]
 
 
 class BadZipFile(Exception):
-    pass
+    """Raised when a file is not a valid ZIP archive or is corrupt."""
 
 
 class LargeZipFile(Exception):

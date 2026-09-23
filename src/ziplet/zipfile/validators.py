@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import stat
-from collections.abc import Callable, Iterable
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -15,6 +15,7 @@ from ziplet.zipfile.extract import (
     ExtractViolation,
     OverwritePolicy,
     ViolationAction,
+    compression_ratio,
     resolve_rule,
 )
 from ziplet.zipfile.info import ZipInfo
@@ -58,16 +59,6 @@ class ValidatorPipeline:
         return violations
 
 
-def custom_validator(callback: Callable[[ZipInfo, Path], None]) -> MemberValidator:
-    """Adapt the established two-argument custom-validator API."""
-
-    def validate(params: ValidatorParams) -> Iterable[ExtractViolation]:
-        callback(params.info, params.target)
-        return ()
-
-    return validate
-
-
 def _violation(
     info: ZipInfo,
     code: str,
@@ -78,12 +69,12 @@ def _violation(
     return ExtractViolation(info.filename, code, message, action, target)
 
 
-def _entry_mode(info: ZipInfo) -> int:
+def entry_mode(info: ZipInfo) -> int:
     return (info.external_attr >> 16) & 0o170000
 
 
-def _entry_type(info: ZipInfo) -> tuple[bool, bool]:
-    mode = _entry_mode(info)
+def entry_type(info: ZipInfo) -> tuple[bool, bool]:
+    mode = entry_mode(info)
     is_symlink = stat.S_ISLNK(mode)
     is_special = bool(
         mode and not is_symlink and not stat.S_ISREG(mode) and not stat.S_ISDIR(mode)
@@ -102,7 +93,7 @@ def _sanitize_windows_name(arcname: str, pathsep: str) -> str:
     return pathsep.join(x for x in parts if x)
 
 
-def _member_target_name(raw_name: str) -> tuple[str, list[str]]:
+def member_target_name(raw_name: str) -> tuple[str, list[str]]:
     target_name = raw_name.replace("/", os.path.sep)
     drive, _ = os.path.splitdrive(raw_name)
     if os.path.sep == "\\":
@@ -119,7 +110,7 @@ def resolve_extract_target(
     info: ZipInfo, destination: Path
 ) -> tuple[Path, str, list[str]]:
     """Resolve the filesystem target for *info*. Pure — produces no violations."""
-    drive, parts = _member_target_name(info.orig_filename)
+    drive, parts = member_target_name(info.orig_filename)
     target = (destination / os.path.sep.join(parts)).resolve()
     return target, drive, parts
 
@@ -238,7 +229,7 @@ def check_compression_ratio(params: ValidatorParams) -> Iterable[ExtractViolatio
     rule = resolve_rule(
         context.policy.max_compression_ratio, context.policy.on_violation
     )
-    ratio = None if info.compress_size == 0 else info.file_size / info.compress_size
+    ratio = compression_ratio(info)
     if rule.value is not None and ratio is not None and ratio > rule.value:
         yield _violation(
             info,
@@ -276,7 +267,7 @@ def check_extension_blocked(params: ValidatorParams) -> Iterable[ExtractViolatio
 def check_symlink_allowed(params: ValidatorParams) -> Iterable[ExtractViolation]:
     info, target, context = params.info, params.target, params.context
     rule = resolve_rule(context.policy.allow_symlinks, context.policy.on_violation)
-    mode = _entry_mode(info)
+    mode = entry_mode(info)
     if stat.S_ISLNK(mode) and not rule.value:
         yield _violation(
             info, "symlink", "symlink extraction is not allowed", target, rule.action
@@ -286,7 +277,7 @@ def check_symlink_allowed(params: ValidatorParams) -> Iterable[ExtractViolation]
 def check_special_file_allowed(params: ValidatorParams) -> Iterable[ExtractViolation]:
     info, target, context = params.info, params.target, params.context
     rule = resolve_rule(context.policy.allow_special_files, context.policy.on_violation)
-    mode = _entry_mode(info)
+    mode = entry_mode(info)
     if (
         mode
         and not stat.S_ISREG(mode)
