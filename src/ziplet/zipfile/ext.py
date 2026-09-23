@@ -19,7 +19,7 @@ from ziplet.compression.methods import (
 )
 from ziplet.cryptography.aes import AesZipDecrypter
 from ziplet.cryptography.zipcrypto import ZipCryptoDecrypter
-from ziplet.exceptions import BadZipFile
+from ziplet.exceptions import BadZipFile, PasswordRequired
 from ziplet.zipfile.info import ZipInfo
 from ziplet.zipfile.io_wrappers import ClosableZipStream
 from ziplet.zipfile.shared import ReadWriteMode, crc32
@@ -90,8 +90,10 @@ class ZipExtFile(io.BufferedIOBase):
                 is encrypted; ignored otherwise.  Defaults to ``None``.
 
         Raises:
-            RuntimeError: If the entry is encrypted but *pwd* is ``None`` or
-                empty.
+            PasswordRequired: If the entry is encrypted but *pwd* is ``None``
+                or empty.
+            BadPassword: If *pwd* does not match the entry's password
+                verifier.
 
         Note:
             The local file header must already have been validated, which
@@ -150,13 +152,13 @@ class ZipExtFile(io.BufferedIOBase):
             class to use for this entry.
 
         Raises:
-            RuntimeError: If the entry is encrypted but no password was
+            PasswordRequired: If the entry is encrypted but no password was
                 supplied.
         """
         decrypter_cls = self._decrypter_class_for_entry()
         if decrypter_cls is AesZipDecrypter:
             if not self._pwd:
-                raise RuntimeError(
+                raise PasswordRequired(
                     f"File {self.name!r} is encrypted with WZ_AES encryption and "
                     "requires a password."
                 )
@@ -171,7 +173,7 @@ class ZipExtFile(io.BufferedIOBase):
             return decrypter_cls
         else:
             if not self._pwd:
-                raise RuntimeError(
+                raise PasswordRequired(
                     f"File {self.name!r} is encrypted, password required for extraction"
                 )
             self.encryption_header = self._fileobj.read(
@@ -216,9 +218,8 @@ class ZipExtFile(io.BufferedIOBase):
             decrypter instance, or ``None`` if the entry is not encrypted.
 
         Raises:
-            RuntimeError: If the password check inside
-                :class:`~ziplet.cryptography.zipcrypto.ZipCryptoDecrypter`
-                fails (wrong password).
+            BadPassword: If the password verifier of the entry's decrypter
+                rejects the password.
         """
         if self._decrypter_cls is not None:
             return self._decrypter_cls(self._zinfo, **self._decrypter_kwargs())
@@ -244,6 +245,29 @@ class ZipExtFile(io.BufferedIOBase):
         self._decompressor: DecompressorBase = (
             self._compression_registry.get_decompressor(self._compress_type)
         )
+
+    def verify_integrity(self) -> None:
+        """Check the whole entry against its integrity data.
+
+        WinZip AES entries carry an HMAC over the ciphertext, so it is checked
+        without decompressing anything.  Other entries are read to the end,
+        which verifies their CRC-32.  The stream position is not preserved.
+
+        Raises:
+            BadZipFile: If the HMAC or CRC-32 does not match, or the entry is
+                truncated.
+        """
+        decrypter = self._decrypter
+        try:
+            if isinstance(decrypter, AesZipDecrypter):
+                while self._compress_left > 0:
+                    self._read2(self.MAX_READ_SIZE)
+                decrypter.check_hmac(self._fileobj.read(decrypter.hmac_size))
+            else:
+                while self.read(self.MAX_READ_SIZE):
+                    pass
+        except EOFError:
+            raise BadZipFile(f"Truncated data for file {self.name!r}") from None
 
     def _check_integrity(self) -> None:
         """Verify the integrity of a fully-read entry.

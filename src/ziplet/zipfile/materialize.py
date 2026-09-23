@@ -25,6 +25,7 @@ from ziplet.zipfile.exceptions import (
     ExtractionSecurityError,
 )
 from ziplet.zipfile.info import ZipInfo
+from ziplet.zipfile.progress import ProgressReporter
 from ziplet.zipfile.secure_fs import open_secure_parent
 from ziplet.zipfile.validators import entry_mode, has_parent_component
 
@@ -81,6 +82,7 @@ class MaterializeParams:
     directory: str
     dir_fd: int | None
     fsync: bool = True
+    reporter: ProgressReporter | None = None
 
 
 class Materializer(Protocol):
@@ -89,10 +91,14 @@ class Materializer(Protocol):
     def __call__(self, params: MaterializeParams) -> MaterializationResult: ...
 
 
+class _Writer(Protocol):
+    def write(self, data: bytes, /) -> int: ...
+
+
 class _QuotaWriter:
     """Write-through wrapper that raises once a size limit would be exceeded."""
 
-    def __init__(self, target: IO[bytes], quota: ExtractionQuota) -> None:
+    def __init__(self, target: _Writer, quota: ExtractionQuota) -> None:
         self._target = target
         self._quota = quota
         self._member_written = 0
@@ -110,6 +116,19 @@ class _QuotaWriter:
             raise ExtractionQuotaExceeded("actual_total_uncompressed_size", total_limit)
         written = self._target.write(data)
         self._member_written += written
+        return written
+
+
+class _ProgressWriter:
+    """Write-through wrapper that reports the bytes it passes on."""
+
+    def __init__(self, target: _Writer, reporter: ProgressReporter) -> None:
+        self._target = target
+        self._reporter = reporter
+
+    def write(self, data: bytes) -> int:
+        written = self._target.write(data)
+        self._reporter.advance(written)
         return written
 
 
@@ -165,11 +184,13 @@ def _open_unique_temp_fd(dir_fd: int) -> tuple[str, int]:
 
 def _copy_payload(params: MaterializeParams, target: IO[bytes]) -> int:
     """Stream the member into *target*, fsync it, and return the byte count."""
+    sink: _Writer = target
+    if not params.quota.unbounded:
+        sink = _QuotaWriter(sink, params.quota)
+    if params.reporter is not None:
+        sink = _ProgressWriter(sink, params.reporter)
     with params.open_member() as source:
-        if params.quota.unbounded:
-            shutil.copyfileobj(source, target)
-        else:
-            shutil.copyfileobj(source, _QuotaWriter(target, params.quota))
+        shutil.copyfileobj(source, sink)
     target.flush()
     if params.fsync:
         os.fsync(target.fileno())
@@ -296,6 +317,7 @@ def materialize_member(
     quota: ExtractionQuota | None = None,
     *,
     fsync: bool = True,
+    reporter: ProgressReporter | None = None,
 ) -> MaterializationResult:
     """Create the filesystem object for *member* at *targetpath* below *root*.
 
@@ -314,6 +336,7 @@ def materialize_member(
             parent or ".",
             dir_fd,
             fsync,
+            reporter,
         )
         return select_materializer(member)(params)
     finally:

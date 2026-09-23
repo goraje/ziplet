@@ -250,6 +250,53 @@ structured result. Size limits are enforced both from archive metadata before
 extraction and against actual bytes written during extraction; an actual-size
 quota breach aborts that member and removes its partial output.
 
+### Progress reporting
+
+`extract()` and `extractall()` accept `progress=`, a callable that receives a
+frozen `ProgressEvent` as each member starts, roughly every MiB while its data
+is written, and when it finishes. It works with and without a policy:
+
+```python
+def show(event: ProgressEvent) -> None:
+    if event.phase is ProgressPhase.FINISH:
+        print(f"{event.member}: {event.status.value} "
+              f"({event.total_bytes_done}/{event.total_bytes} bytes)")
+
+with ZipFile("input.zip") as zf:
+    zf.extractall("out", policy=ExtractPolicy(), progress=show)
+```
+
+Sizes come from the archive's declared metadata, so treat them as hints. The
+callback runs in the extracting thread and must not write to the same
+`ZipFile`. To cancel, raise from the callback: members already extracted stay
+on disk, the member in flight leaves no partial file, and your exception
+propagates unchanged (it is not turned into a per-member failure). With a
+callback, `members` is resolved up front, so an unknown name raises `KeyError`
+before anything is written.
+
+### Checking a password
+
+`ZipFile.check_password()` tells you whether a password fits the encrypted
+members without extracting anything:
+
+```python
+with ZipFile("secret.zip") as zf:
+    result = zf.check_password(b"hunter2")
+    if not result.ok:
+        print("rejected:", result.rejected)
+```
+
+By default it only checks each member's password verifier, so no data is read.
+A rejection is definitive, but an acceptance only means the password is
+probably right: a wrong password still passes about 1 time in 256 for ZipCrypto
+and 1 in 65,536 for WinZip AES. Pass `full=True` for a definitive answer: it
+authenticates each member (the AES HMAC, or the CRC-32 for ZipCrypto), which
+reads the member. A member whose data fails that check is reported as
+`corrupt` rather than `rejected`. Unencrypted members are reported as
+`unencrypted` and never cause a failure. Opening an encrypted member without a
+password raises `PasswordRequired`, and a wrong one raises `BadPassword`; both
+are `RuntimeError` subclasses.
+
 ### Metadata-only inspection
 
 Use `ZipFile.inspect()` to produce a structured report before extraction.
@@ -317,6 +364,11 @@ for member in assessment.members:
 ```
 
 `ViolationAction.ERROR`, `WARN`, and `SKIP` control ordinary policy findings.
+`ExtractPolicy.custom_validator` takes a callable `(ZipInfo, Path) -> None` or a
+sequence of them. Each validator runs for every member; one that raises
+`ValueError`, `OSError`, `RuntimeError` or `BadZipFile` adds a
+`custom_validator` violation carrying the exception message, and the remaining
+validators still run.
 `max_entries` applies to the archive as a whole and is reported once: `ERROR`
 extracts nothing, `SKIP` extracts only the first `max_entries` members, and
 `WARN` warns and extracts everything.

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -12,6 +13,7 @@ if TYPE_CHECKING:
     from ziplet.zipfile.info import ZipInfo
 
 __all__ = [
+    "CustomValidator",
     "MemberAssessment",
     "ExtractMemberResult",
     "ExtractPolicy",
@@ -25,6 +27,8 @@ __all__ = [
 ]
 
 _T = TypeVar("_T")
+
+CustomValidator = Callable[["ZipInfo", Path], None]
 
 
 class OverwritePolicy(str, Enum):
@@ -108,7 +112,7 @@ class ExtractPolicy:
     on_violation: ViolationAction = ViolationAction.ERROR
     preview_only: bool = False
     fsync_files: bool = True
-    custom_validator: Callable[["ZipInfo", Path], None] | None = None
+    custom_validator: CustomValidator | Sequence[CustomValidator] | None = None
 
 
 @dataclass(frozen=True)

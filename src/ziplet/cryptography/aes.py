@@ -17,7 +17,7 @@ from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 from ziplet.cryptography.base import BaseZipDecrypter, BaseZipEncryptor, _ReadableStream
-from ziplet.exceptions import BadZipFile
+from ziplet.exceptions import BadPassword, BadZipFile
 
 if TYPE_CHECKING:
     from ziplet.zipfile.info import ZipInfo
@@ -173,7 +173,7 @@ class AesZipDecrypter(BaseZipDecrypter):
 
         Raises:
             BadZipFile: If *zinfo* has no AES strength field.
-            RuntimeError: If *pwd* does not match the password-verification
+            BadPassword: If *pwd* does not match the password-verification
                 bytes in *encryption_header*.
         """
         self.filename = zinfo.filename
@@ -206,7 +206,7 @@ class AesZipDecrypter(BaseZipDecrypter):
         keymaterial = kdf.derive(pwd)
 
         if not stdlib_hmac.compare_digest(keymaterial[2 * key_length :], pwd_verify):
-            raise RuntimeError("Bad password for file %r" % zinfo.filename)
+            raise BadPassword("Bad password for file %r" % zinfo.filename)
 
         self.decrypter = _AesCtrWithLittleEndian(keymaterial[:key_length])
         self.hmac = hmac.HMAC(

@@ -23,10 +23,13 @@ from ziplet.zipfile.extract import (
 )
 from ziplet.zipfile.info import ZipInfo
 from ziplet.zipfile.materialize import ExtractionQuota, MaterializationResult
+from ziplet.zipfile.progress import ProgressReporter
 
 __all__ = ["Materialize", "extract_with_policy"]
 
-Materialize = Callable[[ZipInfo, Path, ExtractionQuota], MaterializationResult]
+Materialize = Callable[
+    [ZipInfo, Path, ExtractionQuota, ProgressReporter | None], MaterializationResult
+]
 
 _MATERIALIZATION_ERRORS = (
     OSError,
@@ -104,11 +107,13 @@ def extract_with_policy(
     policy_root: Path,
     policy: ExtractPolicy,
     materialize: Materialize,
+    reporter: ProgressReporter | None = None,
 ) -> ExtractResult:
     """Extract *infos* under *policy*, reporting per-member outcomes.
 
     Each member is assessed first; only members whose findings permit it are
-    passed to *materialize*.  Failures are recorded, not raised.
+    passed to *materialize*.  Failures are recorded, not raised.  When a
+    *reporter* is given, every member gets a start and a finish notification.
     """
     violations: list[ExtractViolation] = []
     results: list[ExtractMemberResult] = []
@@ -133,10 +138,10 @@ def extract_with_policy(
         policy.max_total_uncompressed_size, policy.on_violation
     ).value
 
-    for index, info in enumerate(infos):
+    def process(index: int, info: ZipInfo) -> ExtractMemberResult:
+        nonlocal total_written
         if entry_limit is not None and index >= entry_limit:
-            results.append(_member_result(info, MemberStatus.SKIPPED, None, 0, ()))
-            continue
+            return _member_result(info, MemberStatus.SKIPPED, None, 0, ())
         state.total_declared += info.file_size
         state.total_compressed += info.compress_size
         assessment = assess_member(info, destination, policy_root, policy, state)
@@ -145,63 +150,57 @@ def extract_with_policy(
         violations.extend(member_violations)
 
         if assessment.has_errors:
-            results.append(
-                _member_result(info, MemberStatus.FAILED, target, 0, member_violations)
+            return _member_result(
+                info, MemberStatus.FAILED, target, 0, member_violations
             )
-            continue
         if assessment.should_skip:
-            results.append(
-                _member_result(info, MemberStatus.SKIPPED, target, 0, member_violations)
+            return _member_result(
+                info, MemberStatus.SKIPPED, target, 0, member_violations
             )
-            continue
         for violation in member_violations:
             warnings.warn(violation.message, stacklevel=_WARN_STACKLEVEL)
 
         if policy.preview_only:
-            results.append(
-                _member_result(
-                    info, MemberStatus.PREVIEWED, target, 0, member_violations
-                )
+            return _member_result(
+                info, MemberStatus.PREVIEWED, target, 0, member_violations
             )
-            continue
 
         assert target is not None
         target = _unique_target(target, policy)
         was_existing = target.exists()
         quota = ExtractionQuota(member_limit, total_limit, total_written)
         try:
-            materialized = materialize(info, target, quota)
+            materialized = materialize(info, target, quota, reporter)
         except ExtractionQuotaExceeded as exc:
             code, message = exc.code, str(exc)
         except _MATERIALIZATION_ERRORS as exc:
             code, message = "extraction_error", str(exc)
         else:
             total_written += materialized.bytes_written
-            results.append(
-                _member_result(
-                    info,
-                    MemberStatus.EXTRACTED,
-                    materialized.target,
-                    materialized.bytes_written,
-                    member_violations,
-                    was_existing,
-                )
+            return _member_result(
+                info,
+                MemberStatus.EXTRACTED,
+                materialized.target,
+                materialized.bytes_written,
+                member_violations,
+                was_existing,
             )
-            continue
 
         violation = ExtractViolation(
             info.filename, code, message, ViolationAction.ERROR, target
         )
         violations.append(violation)
-        results.append(
-            _member_result(
-                info,
-                MemberStatus.FAILED,
-                target,
-                0,
-                member_violations + (violation,),
-            )
+        return _member_result(
+            info, MemberStatus.FAILED, target, 0, member_violations + (violation,)
         )
+
+    for index, info in enumerate(infos):
+        if reporter is not None:
+            reporter.start(index, info)
+        result = process(index, info)
+        results.append(result)
+        if reporter is not None:
+            reporter.finish(result.status, result.bytes_written)
 
     extracted = sum(r.status == MemberStatus.EXTRACTED for r in results)
     skipped = sum(

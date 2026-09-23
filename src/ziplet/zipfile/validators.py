@@ -317,10 +317,15 @@ def check_utf8_name(params: ValidatorParams) -> Iterable[ExtractViolation]:
 
 
 def check_custom_validator(params: ValidatorParams) -> Iterable[ExtractViolation]:
+    """Run each user-supplied validator; every rejection is its own violation."""
     info, target, policy = params.info, params.target, params.context.policy
-    if policy.custom_validator is not None:
+    configured = policy.custom_validator
+    if configured is None:
+        return
+    validators = (configured,) if callable(configured) else tuple(configured)
+    for validator in validators:
         try:
-            policy.custom_validator(info, target)
+            validator(info, target)
         except (OSError, ValueError, BadZipFile, RuntimeError) as exc:
             yield _violation(
                 info, "custom_validator", str(exc), target, policy.on_violation

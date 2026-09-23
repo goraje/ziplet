@@ -8,6 +8,7 @@ import threading
 import warnings
 from collections.abc import Iterable
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from types import TracebackType
 from typing import IO, TYPE_CHECKING, Literal, TypeAlias, cast, overload
@@ -27,7 +28,7 @@ from ziplet.compression import ZIP_LZMA, ZIP_STORED, Registry, registry
 from ziplet.cryptography import WZ_AES, ZIP_CRYPTO
 from ziplet.cryptography.aes import AesZipEncryptor
 from ziplet.cryptography.zipcrypto import ZipCryptoEncryptor
-from ziplet.exceptions import BadZipFile, LargeZipFile
+from ziplet.exceptions import BadZipFile, LargeZipFile, PasswordRequired
 from ziplet.zipfile.assessment import (
     ArchiveAssessment,
 )
@@ -41,6 +42,7 @@ from ziplet.zipfile.extract import (
     ExtractMemberResult,
     ExtractPolicy,
     ExtractResult,
+    MemberStatus,
     normalized_destination,
 )
 from ziplet.zipfile.info import ZipInfo
@@ -58,7 +60,17 @@ from ziplet.zipfile.materialize import (
     MaterializationResult,
     materialize_member,
 )
+from ziplet.zipfile.password import (
+    MemberPasswordCheck,
+    PasswordCheckResult,
+    check_member_password,
+)
 from ziplet.zipfile.policy_extraction import extract_with_policy
+from ziplet.zipfile.progress import (
+    ProgressCallback,
+    ProgressReporter,
+    propagate_callback_errors,
+)
 from ziplet.zipfile.records import (
     looks_like_zip,
     read_directory,
@@ -416,6 +428,65 @@ class ZipFile:
             date = "%d-%02d-%02d %02d:%02d:%02d" % zinfo.date_time[:6]
             print("%-46s %s %12d" % (zinfo.filename, date, zinfo.file_size), file=file)
 
+    def check_password(
+        self,
+        pwd: bytes | None = None,
+        members: Iterable[str | ZipInfo] | None = None,
+        *,
+        full: bool = False,
+    ) -> PasswordCheckResult:
+        """Check whether *pwd* is the password of the encrypted members.
+
+        By default only each member's password verifier is checked, so no
+        payload is read or decompressed.  A rejection is definitive, but an
+        acceptance only means the password is probably right: a wrong password
+        still passes about 1 time in 256 for ZipCrypto and 1 in 65,536 for
+        WinZip AES.  With ``full=True`` each member is also authenticated (the
+        AES HMAC, or the CRC-32 for ZipCrypto), which is definitive but reads
+        the member; a member whose data fails that check is reported as
+        ``CORRUPT`` rather than ``REJECTED``.
+
+        Args:
+            pwd: Password to test. Defaults to :attr:`pwd`.
+            members: Member names or infos to check. Defaults to all members.
+            full: Authenticate each member's data as well.
+
+        Returns:
+            A :class:`~ziplet.zipfile.password.PasswordCheckResult`;
+            unencrypted members are reported as ``UNENCRYPTED``.
+
+        Raises:
+            TypeError: If *pwd* is not ``bytes``.
+            ValueError: If no non-empty password is available, or the archive
+                is closed or being written.
+        """
+        if pwd is None:
+            pwd = self.pwd
+        if pwd is not None and not isinstance(pwd, bytes):
+            raise TypeError("pwd: expected bytes, got %s" % type(pwd).__name__)
+        if not pwd:
+            raise ValueError("check_password() requires a non-empty password")
+        if not self.fp:
+            raise ValueError("Attempt to use ZIP archive that was already closed")
+        self._write_coordinator.ensure_readable()
+
+        infos = (
+            self.filelist
+            if members is None
+            else [m if isinstance(m, ZipInfo) else self.getinfo(m) for m in members]
+        )
+        return PasswordCheckResult(
+            tuple(
+                MemberPasswordCheck(
+                    info.filename,
+                    check_member_password(
+                        partial(self._open_to_read, "r", info, pwd), info, full=full
+                    ),
+                )
+                for info in infos
+            )
+        )
+
     def testzip(self) -> str | None:
         """Verify each archive member by reading it and checking its CRC.
 
@@ -489,13 +560,13 @@ class ZipFile:
             selected scheme.
 
         Raises:
-            RuntimeError: If no password is available.
+            PasswordRequired: If no password is available.
             NotImplementedError: If the encryption scheme is unknown.
         """
         method = self.encryption if encryption is None else encryption
         pwd = self.pwd if password is None else password
         if pwd is None:
-            raise RuntimeError("Encrypted entries require a password")
+            raise PasswordRequired("Encrypted entries require a password")
         if method == WZ_AES:
             return AesZipEncryptor(
                 pwd,
@@ -573,8 +644,9 @@ class ZipFile:
         Raises:
             ValueError: If *mode* is invalid, *pwd* is supplied with
                 ``mode='w'``, or the archive is closed.
-            RuntimeError: If the member is encrypted and no password is
+            PasswordRequired: If the member is encrypted and no password is
                 available.
+            BadPassword: If the password does not match the member.
             NotImplementedError: If the member uses compressed patch data or
                 strong encryption.
             BadZipFile: If the local file header is corrupt.
@@ -636,8 +708,9 @@ class ZipFile:
                 overlap.
             NotImplementedError: If compressed patch data or strong encryption
                 are detected.
-            RuntimeError: If the entry is encrypted and no password is
+            PasswordRequired: If the entry is encrypted and no password is
                 available.
+            BadPassword: If the password does not match the entry.
             TypeError: If *pwd* is not ``bytes``.
         """
         assert self.fp is not None
@@ -675,7 +748,7 @@ class ZipFile:
                 if pwd and not isinstance(pwd, bytes):
                     raise TypeError("pwd: expected bytes, got %s" % type(pwd).__name__)
                 if not pwd:
-                    raise RuntimeError(
+                    raise PasswordRequired(
                         "File %r is encrypted, password "
                         "required for extraction" % zinfo.orig_filename
                     )
@@ -782,6 +855,7 @@ class ZipFile:
         pwd: bytes | None = None,
         *,
         policy: None = None,
+        progress: ProgressCallback | None = None,
     ) -> str: ...
 
     @overload
@@ -792,6 +866,7 @@ class ZipFile:
         pwd: bytes | None = None,
         *,
         policy: ExtractPolicy,
+        progress: ProgressCallback | None = None,
     ) -> ExtractMemberResult: ...
 
     def extract(
@@ -801,6 +876,7 @@ class ZipFile:
         pwd: bytes | None = None,
         *,
         policy: ExtractPolicy | None = None,
+        progress: ProgressCallback | None = None,
     ) -> str | ExtractMemberResult:
         """Extract a single member to *path* on the filesystem.
 
@@ -810,23 +886,24 @@ class ZipFile:
             path: Destination directory. Defaults to the current working
                 directory when ``None``.
             pwd: Decryption password, or ``None`` to use :attr:`pwd`.
+            policy: Opt-in extraction policy; see :class:`ExtractPolicy`.
+            progress: Callback receiving a :class:`ProgressEvent` as the
+                member starts, as its data is written, and when it finishes.
+                Raise from it to cancel; the exception propagates unchanged.
 
         Returns:
             The normalized path of the extracted file or directory.
         """
         if policy is not None:
-            result = self._extract_with_policy(
-                [member],
-                path,
-                pwd,
-                policy,
-            )
+            result = self._extract_with_policy([member], path, pwd, policy, progress)
             if result.failed_count:
                 raise ExtractionError(result)
             return result.members[0]
 
         path = os.fspath(os.getcwd() if path is None else path)
-        return str(self._extract_member(member, path, pwd).target)
+        if progress is None:
+            return str(self._extract_member(member, path, pwd).target)
+        return str(self._extract_all_with_progress([member], path, pwd, progress)[0])
 
     @overload
     def extractall(
@@ -836,6 +913,7 @@ class ZipFile:
         pwd: bytes | None = None,
         *,
         policy: None = None,
+        progress: ProgressCallback | None = None,
     ) -> None: ...
 
     @overload
@@ -846,6 +924,7 @@ class ZipFile:
         pwd: bytes | None = None,
         *,
         policy: ExtractPolicy,
+        progress: ProgressCallback | None = None,
     ) -> ExtractResult: ...
 
     def extractall(
@@ -855,6 +934,7 @@ class ZipFile:
         pwd: bytes | None = None,
         *,
         policy: ExtractPolicy | None = None,
+        progress: ProgressCallback | None = None,
     ) -> None | ExtractResult:
         """Extract all (or a subset of) members to *path* on the filesystem.
 
@@ -865,18 +945,51 @@ class ZipFile:
                 :class:`~ziplet.zipfile.info.ZipInfo` instances to
                 extract. Defaults to all members when ``None``.
             pwd: Decryption password, or ``None`` to use :attr:`pwd`.
+            policy: Opt-in extraction policy; see :class:`ExtractPolicy`.
+            progress: Callback receiving a :class:`ProgressEvent` as each
+                member starts, as its data is written, and when it finishes.
+                Raise from it to cancel; members already extracted stay on
+                disk, the member in flight leaves no partial file, and the
+                exception propagates unchanged.  With a callback, *members* is
+                resolved up front, so an unknown name raises ``KeyError``
+                before anything is written.
         """
         if members is None:
             members = self.namelist()
         if policy is not None:
-            result = self._extract_with_policy(list(members), path, pwd, policy)
+            result = self._extract_with_policy(
+                list(members), path, pwd, policy, progress
+            )
             if result.failed_count:
                 raise ExtractionError(result)
             return result
         path = os.fspath(os.getcwd() if path is None else path)
+        if progress is not None:
+            self._extract_all_with_progress(list(members), path, pwd, progress)
+            return None
         for zipinfo in members:
             self._extract_member(zipinfo, path, pwd)
         return None
+
+    def _extract_all_with_progress(
+        self,
+        members: list[str | ZipInfo],
+        path: str,
+        pwd: bytes | None,
+        progress: ProgressCallback,
+    ) -> list[Path]:
+        infos = [m if isinstance(m, ZipInfo) else self.getinfo(m) for m in members]
+        reporter = ProgressReporter(
+            progress, len(infos), sum(info.file_size for info in infos)
+        )
+        targets: list[Path] = []
+        with propagate_callback_errors():
+            for index, info in enumerate(infos):
+                reporter.start(index, info)
+                result = self._extract_member(info, path, pwd, reporter=reporter)
+                reporter.finish(MemberStatus.EXTRACTED, result.bytes_written)
+                targets.append(result.target)
+        return targets
 
     def _extract_with_policy(
         self,
@@ -884,6 +997,7 @@ class ZipFile:
         path: StrPath | None,
         pwd: bytes | None,
         policy: ExtractPolicy,
+        progress: ProgressCallback | None = None,
     ) -> ExtractResult:
         destination = normalized_destination(path or os.getcwd())
         policy_root = (
@@ -895,20 +1009,30 @@ class ZipFile:
             member if isinstance(member, ZipInfo) else self.getinfo(member)
             for member in members
         ]
-        return extract_with_policy(
-            infos,
-            destination,
-            policy_root,
-            policy,
-            lambda info, target, quota: self._extract_member(
-                info,
-                str(destination),
-                pwd,
-                target_override=target,
-                quota=quota,
-                fsync=policy.fsync_files,
-            ),
+        reporter = (
+            None
+            if progress is None
+            else ProgressReporter(
+                progress, len(infos), sum(info.file_size for info in infos)
+            )
         )
+        with propagate_callback_errors():
+            return extract_with_policy(
+                infos,
+                destination,
+                policy_root,
+                policy,
+                lambda info, target, quota, reporter: self._extract_member(
+                    info,
+                    str(destination),
+                    pwd,
+                    target_override=target,
+                    quota=quota,
+                    fsync=policy.fsync_files,
+                    reporter=reporter,
+                ),
+                reporter,
+            )
 
     def _extract_member(
         self,
@@ -919,6 +1043,7 @@ class ZipFile:
         target_override: Path | None = None,
         quota: ExtractionQuota | None = None,
         fsync: bool = True,
+        reporter: ProgressReporter | None = None,
     ) -> MaterializationResult:
         """Extract *member* to *targetpath* and return the materialization result.
 
@@ -961,6 +1086,7 @@ class ZipFile:
             destination,
             quota,
             fsync=fsync,
+            reporter=reporter,
         )
 
     def _mark_modified(self) -> None:

@@ -363,3 +363,73 @@ def test_inspection_reports_entry_count_once() -> None:
     assert [v.member for v in report.violations if v.code == "max_entries"] == [
         "<archive>"
     ]
+
+
+def _reject_temp_files(info: ZipInfo, target: Path) -> None:
+    if info.filename.endswith(".tmp"):
+        raise ValueError(f"{info.filename}: temporary files are not allowed")
+
+
+def _reject_large_names(info: ZipInfo, target: Path) -> None:
+    if len(info.filename) > 8:
+        raise ValueError(f"{info.filename}: name is too long")
+
+
+def _custom_archive() -> io.BytesIO:
+    buffer = io.BytesIO()
+    with ziplet.ZipFile(buffer, "w") as zf:
+        zf.writestr("ok.txt", b"1")
+        zf.writestr("a.tmp", b"2")
+        zf.writestr("very_long_name.tmp", b"3")
+    return io.BytesIO(buffer.getvalue())
+
+
+def _custom_messages(assessment: ziplet.ArchiveAssessment) -> list[str]:
+    return [v.message for v in assessment.violations if v.code == "custom_validator"]
+
+
+def test_single_custom_validator_still_works(tmp_path: Path) -> None:
+    policy = ziplet.ExtractPolicy(custom_validator=_reject_temp_files)
+    with ziplet.ZipFile(_custom_archive()) as zf:
+        assessment = zf.assess(tmp_path, policy)
+    assert _custom_messages(assessment) == [
+        "a.tmp: temporary files are not allowed",
+        "very_long_name.tmp: temporary files are not allowed",
+    ]
+
+
+def test_custom_validator_chain_reports_every_rejection(tmp_path: Path) -> None:
+    policy = ziplet.ExtractPolicy(
+        custom_validator=(_reject_temp_files, _reject_large_names)
+    )
+    with ziplet.ZipFile(_custom_archive()) as zf:
+        assessment = zf.assess(tmp_path, policy)
+    assert _custom_messages(assessment) == [
+        "a.tmp: temporary files are not allowed",
+        "very_long_name.tmp: temporary files are not allowed",
+        "very_long_name.tmp: name is too long",
+    ]
+    ok, temp, long_temp = assessment.members
+    assert not ok.violations
+    assert len(temp.violations) == 1
+    assert len(long_temp.violations) == 2
+
+
+def test_custom_validator_chain_can_skip_members(tmp_path: Path) -> None:
+    policy = ziplet.ExtractPolicy(
+        custom_validator=[_reject_temp_files, _reject_large_names],
+        on_violation=ziplet.ViolationAction.SKIP,
+    )
+    with ziplet.ZipFile(_custom_archive()) as zf:
+        result = zf.extractall(tmp_path, policy=policy)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["ok.txt"]
+    assert (result.extracted_count, result.skipped_count) == (1, 2)
+
+
+def test_custom_validator_unexpected_error_propagates(tmp_path: Path) -> None:
+    def broken(info: ZipInfo, target: Path) -> None:
+        raise KeyError("bug in validator")
+
+    with ziplet.ZipFile(_custom_archive()) as zf:
+        with pytest.raises(KeyError):
+            zf.assess(tmp_path, ziplet.ExtractPolicy(custom_validator=broken))

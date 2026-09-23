@@ -7,6 +7,7 @@ import pytest
 
 from ziplet.cryptography.aes import AesZipDecrypter
 from ziplet.cryptography.zipcrypto import ZipCryptoDecrypter
+from ziplet.exceptions import PasswordRequired
 from ziplet.zipfile.ext import ZipExtFile
 from ziplet.zipfile.info import WzAesExtra, ZipInfo
 
@@ -27,7 +28,7 @@ class TestZipExtFileSetupDecrypter:
         ext._pwd = None
         ext.name = "secret.txt"
 
-        with pytest.raises(RuntimeError, match="requires a password"):
+        with pytest.raises(PasswordRequired, match="requires a password"):
             ext._setup_decrypter()
 
     def test_zipcrypto_missing_password_raises(self) -> None:
@@ -38,7 +39,7 @@ class TestZipExtFileSetupDecrypter:
         ext._pwd = None
         ext.name = "secret.txt"
 
-        with pytest.raises(RuntimeError, match="password required"):
+        with pytest.raises(PasswordRequired, match="password required"):
             ext._setup_decrypter()
 
     def test_aes_branch_reads_header_and_subtracts_hmac(self) -> None:

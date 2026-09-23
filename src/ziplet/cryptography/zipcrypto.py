@@ -14,7 +14,7 @@ import os
 from typing import TYPE_CHECKING
 
 from ziplet.cryptography.base import BaseZipDecrypter, BaseZipEncryptor
-from ziplet.exceptions import BadZipFile
+from ziplet.exceptions import BadPassword, BadZipFile
 from ziplet.zipfile.shared import MASK_USE_DATA_DESCRIPTOR
 
 if TYPE_CHECKING:
@@ -125,7 +125,7 @@ class ZipCryptoDecrypter(BaseZipDecrypter):
                 from the beginning of the entry data.
 
         Raises:
-            RuntimeError: If *pwd* does not match the check byte in
+            BadPassword: If *pwd* does not match the check byte in
                 *encryption_header*.
         """
         if len(encryption_header) != self.encryption_header_length:
@@ -146,7 +146,7 @@ class ZipCryptoDecrypter(BaseZipDecrypter):
             # compare against the CRC otherwise
             check_byte = (zinfo.CRC >> 24) & 0xFF
         if h[11] != check_byte:
-            raise RuntimeError("Bad password for file %r" % zinfo.filename)
+            raise BadPassword("Bad password for file %r" % zinfo.filename)
 
     @classmethod
     def header_length(cls, zinfo: ZipInfo) -> int:

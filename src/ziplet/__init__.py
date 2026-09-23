@@ -7,6 +7,7 @@ from ziplet.compression import (
     Registry,
 )
 from ziplet.cryptography import WZ_AES, WZ_AES_V1, WZ_AES_V2, ZIP_CRYPTO
+from ziplet.exceptions import BadPassword, PasswordError, PasswordRequired
 from ziplet.zipfile.assessment import ArchiveAssessment, ExtractionContext
 from ziplet.zipfile.exceptions import (
     ExtractionFailure,
@@ -35,7 +36,13 @@ from ziplet.zipfile.file import (
 )
 from ziplet.zipfile.info import WzAesExtra
 from ziplet.zipfile.inspection import InspectionMember, InspectionResult
+from ziplet.zipfile.password import (
+    MemberPasswordCheck,
+    PasswordCheckResult,
+    PasswordStatus,
+)
 from ziplet.zipfile.path import Path
+from ziplet.zipfile.progress import ProgressCallback, ProgressEvent, ProgressPhase
 
 __all__ = [
     "WZ_AES",
@@ -67,6 +74,15 @@ __all__ = [
     "MemberStatus",
     "MemberAssessment",
     "ArchiveAssessment",
+    "BadPassword",
+    "MemberPasswordCheck",
+    "PasswordCheckResult",
+    "PasswordError",
+    "PasswordRequired",
+    "PasswordStatus",
+    "ProgressCallback",
+    "ProgressEvent",
+    "ProgressPhase",
     "ExtractionContext",
     "OverwritePolicy",
     "ViolationAction",
