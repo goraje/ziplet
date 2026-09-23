@@ -34,12 +34,19 @@ class WriteCoordinator:
         return self._condition
 
     @property
-    def state(self) -> WriterArchiveState:
-        return self._state
-
-    @property
     def active(self) -> bool:
-        return self._state != WriterArchiveState.IDLE
+        """Whether a writer currently holds (or is finalizing) a reservation.
+
+        ``FAILED`` is deliberately excluded: it's a terminal state reached
+        after a write already released its reservation (see :meth:`fail`),
+        and nothing should stay blocked because of a writer that no longer
+        exists. Without this, the archive would be permanently unusable
+        after any single failed write.
+        """
+        return self._state in (
+            WriterArchiveState.ACTIVE,
+            WriterArchiveState.FINALIZING,
+        )
 
     def reserve(self) -> WriterReservation:
         with self._condition:

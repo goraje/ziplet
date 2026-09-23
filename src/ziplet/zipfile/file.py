@@ -5,6 +5,7 @@ from __future__ import annotations
 import binascii
 import io
 import os
+import secrets
 import shutil
 import stat
 import struct
@@ -174,6 +175,25 @@ class _ExtractionQuotaWriter:
         written = self._target.write(data)
         self.member_written += written
         return written
+
+
+def _open_unique_temp_fd(dir_fd: int, prefix: str = ".ziplet-") -> tuple[str, int]:
+    """Create a uniquely-named file relative to *dir_fd* and return (name, fd).
+
+    Mirrors ``tempfile.NamedTemporaryFile``'s collision handling, but via
+    ``os.open(..., dir_fd=...)`` so the create is relative to an
+    already-validated directory descriptor instead of a path string.
+    """
+    for _ in range(100):
+        name = f"{prefix}{secrets.token_hex(8)}"
+        try:
+            fd = os.open(
+                name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=dir_fd
+            )
+        except FileExistsError:
+            continue
+        return name, fd
+    raise OSError("Could not create a unique temporary file for extraction")
 
 
 # ---------------------------------------------------------------------------
@@ -1905,43 +1925,75 @@ class ZipFile:
             return MaterializationResult(Path(targetpath), 0, existed)
         raise ExtractionMaterializationError("Unsupported special file type")
 
-    def _materialize_regular_file(
-        self, params: MaterializeParams
-    ) -> MaterializationResult:
-        member, targetpath = params.member, params.targetpath
+    def _copy_member_into(self, params: MaterializeParams, target: IO[bytes]) -> None:
         quota_member_limit, quota_total_limit = (
             params.quota_member_limit,
             params.quota_total_limit,
         )
+        with self.open(params.member, pwd=params.pwd) as source:
+            if quota_member_limit is None and quota_total_limit is None:
+                shutil.copyfileobj(source, target)
+            else:
+                quota_target = _ExtractionQuotaWriter(
+                    target,
+                    member_limit=quota_member_limit,
+                    total_limit=quota_total_limit,
+                    total_written=params.quota_total_written,
+                )
+                shutil.copyfileobj(source, quota_target)
+
+    def _materialize_regular_file(
+        self, params: MaterializeParams
+    ) -> MaterializationResult:
+        targetpath, dir_fd = params.targetpath, params.dir_fd
+        if (
+            dir_fd is not None
+            and os.open in os.supports_dir_fd
+            and os.rename in os.supports_dir_fd
+        ):
+            name = os.path.basename(targetpath)
+            try:
+                os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                existed = True
+            except FileNotFoundError:
+                existed = False
+            temp_name: str | None = None
+            bytes_written = 0
+            try:
+                temp_name, fd = _open_unique_temp_fd(dir_fd)
+                with os.fdopen(fd, "wb") as target:
+                    self._copy_member_into(params, target)
+                    target.flush()
+                    os.fsync(target.fileno())
+                    bytes_written = target.tell()
+                os.rename(temp_name, name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+                temp_name = None
+            finally:
+                if temp_name is not None:
+                    try:
+                        os.unlink(temp_name, dir_fd=dir_fd)
+                    except FileNotFoundError:
+                        pass
+            return MaterializationResult(Path(targetpath), bytes_written, existed)
+
         existed = os.path.lexists(targetpath)
-        temp_name: str | None = None
+        path_temp_name: str | None = None
         bytes_written = 0
         try:
             with tempfile.NamedTemporaryFile(
                 mode="wb", dir=params.directory, prefix=".ziplet-", delete=False
             ) as target:
-                temp_name = target.name
-                if quota_member_limit is None and quota_total_limit is None:
-                    with self.open(member, pwd=params.pwd) as source:
-                        shutil.copyfileobj(source, target)
-                else:
-                    with self.open(member, pwd=params.pwd) as source:
-                        quota_target = _ExtractionQuotaWriter(
-                            target,
-                            member_limit=quota_member_limit,
-                            total_limit=quota_total_limit,
-                            total_written=params.quota_total_written,
-                        )
-                        shutil.copyfileobj(source, quota_target)
+                path_temp_name = target.name
+                self._copy_member_into(params, target)
                 target.flush()
                 os.fsync(target.fileno())
                 bytes_written = target.tell()
-            os.replace(temp_name, targetpath)
-            temp_name = None
+            os.replace(path_temp_name, targetpath)
+            path_temp_name = None
         finally:
-            if temp_name is not None:
+            if path_temp_name is not None:
                 try:
-                    os.unlink(temp_name)
+                    os.unlink(path_temp_name)
                 except FileNotFoundError:
                     pass
 

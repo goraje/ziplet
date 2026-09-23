@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import io
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
 
+import ziplet
 from ziplet.compression import ZIP_STORED
 from ziplet.zipfile import write as write_mod
 from ziplet.zipfile.info import ZipInfo
@@ -148,3 +150,33 @@ class TestZipWriteFile:
             write_module.ZIP64_LIMIT = original
         assert zwf._state == write_mod.WriteState.FAILED
         assert zinfo not in parent.filelist
+
+
+class TestWriteCoordinatorRecovery:
+    def test_zipfile_usable_after_failed_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A failed write must not permanently lock the archive.
+
+        Regression test: WriteCoordinator.fail() leaves the coordinator in
+        WriterArchiveState.FAILED, a terminal state distinct from IDLE.
+        `active` must treat FAILED as "not active" — otherwise every
+        subsequent read, write, or close on this ZipFile raises forever.
+        """
+        original_limit = cast(Any, write_mod).ZIP64_LIMIT
+        monkeypatch.setattr(write_mod, "ZIP64_LIMIT", 1)
+        archive = tmp_path / "recover.zip"
+        zf = ziplet.ZipFile(archive, "w")
+        writer = zf.open("big.bin", "w")
+        writer.write(b"abcd")
+        with pytest.raises(RuntimeError, match="ZIP64 limit"):
+            writer.close()
+
+        assert not zf._write_coordinator.active
+
+        monkeypatch.setattr(write_mod, "ZIP64_LIMIT", original_limit)
+        zf.writestr("small.txt", b"ok")
+        zf.close()
+
+        with ziplet.ZipFile(archive) as zf2:
+            assert zf2.read("small.txt") == b"ok"

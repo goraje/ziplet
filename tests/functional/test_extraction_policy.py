@@ -248,3 +248,27 @@ def test_dir_fd_relative_directory_materialization_rejects_leaf_symlink(
             zf.extract("payload/", destination)
 
     assert (destination / "payload").is_symlink()
+
+
+def test_dir_fd_relative_regular_file_replaces_leaf_symlink_without_following(
+    tmp_path: Path,
+) -> None:
+    """Regular-file materialization now also goes through the dir_fd-relative
+    path (rename relative to the validated parent). A pre-existing symlink
+    at the leaf name must be replaced outright, never followed to write
+    through it to wherever it points."""
+    archive = tmp_path / "leaf-symlink-file.zip"
+    destination = tmp_path / "out"
+    outside = tmp_path / "outside.txt"
+    destination.mkdir()
+    outside.write_bytes(b"original-outside-content")
+    (destination / "payload.txt").symlink_to(outside)
+    with ziplet.ZipFile(archive, "w") as zf:
+        zf.writestr("payload.txt", b"new-content")
+
+    with ziplet.ZipFile(archive) as zf:
+        zf.extract("payload.txt", destination)
+
+    assert not (destination / "payload.txt").is_symlink()
+    assert (destination / "payload.txt").read_bytes() == b"new-content"
+    assert outside.read_bytes() == b"original-outside-content"

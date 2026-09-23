@@ -125,6 +125,7 @@ class ZipCryptoDecrypter(BaseZipDecrypter):
         """
         if len(encryption_header) != self.encryption_header_length:
             raise BadZipFile("Truncated ZipCrypto encryption header")
+        self.filename = zinfo.filename
         self._state = _ZipCryptoState(pwd)
 
         # The first 12 bytes in the cypher stream is an encryption header

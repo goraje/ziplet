@@ -116,8 +116,9 @@ class ZipWriteFile(io.BufferedIOBase):
     def _write_local_header(self) -> None:
         """Serialise and write the local file header to the archive.
 
-        Also marks the parent :class:`ZipFile` as modified and sets the
-        internal *_writing* flag so that concurrent opens are rejected.
+        Also marks the parent :class:`ZipFile` as modified. Concurrent
+        opens are rejected via the parent's ``_write_coordinator``, whose
+        reservation is already active by the time this runs.
         """
         header = self._zinfo.FileHeader(self._zip64)
         # From this point onwards, we have modified the archive.

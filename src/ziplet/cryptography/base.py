@@ -37,6 +37,7 @@ class BaseZipDecrypter(ABC):
     """
 
     authentication_trailer_length: int = 0
+    filename: str = "?"
 
     @abstractmethod
     def decrypt(self, data: bytes) -> bytes:
@@ -96,7 +97,7 @@ class BaseZipDecrypter(ABC):
             and running_crc is not None
             and running_crc != expected_crc
         ):
-            raise BadZipFile("Bad CRC-32")
+            raise BadZipFile(f"Bad CRC-32 for file {self.filename!r}")
 
 
 class BaseZipEncryptor(ABC):

@@ -23,8 +23,9 @@ class MaterializeParams:
     """Bundles one materializer call's arguments.
 
     A materializer only reads the fields it needs — e.g. directory/symlink
-    materialization ignores ``pwd``/quota fields, regular-file
-    materialization ignores ``dir_fd``.
+    materialization ignores ``pwd``/quota fields; special-file
+    materialization ignores ``dir_fd`` (no stdlib dir_fd-relative FIFO
+    creation exists).
     """
 
     member: ZipInfo
