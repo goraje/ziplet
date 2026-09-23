@@ -35,7 +35,6 @@ def _make_parent() -> SimpleNamespace:
     return SimpleNamespace(
         fp=io.BytesIO(),
         _didModify=False,
-        _writing=False,
         start_dir=0,
         filelist=[],
         NameToInfo={},
@@ -69,14 +68,14 @@ class TestZipWriteFile:
         assert zwf._compress_size == 3
         zwf.close()
 
-    def test_close_registers_entry_and_clears_writing_flag(self) -> None:
+    def test_close_registers_entry_and_commits_state(self) -> None:
         parent = _make_parent()
         zinfo = _make_zinfo("b.txt")
 
         with ZipWriteFile(cast(Any, parent), zinfo, zip64=False) as zwf:
             zwf.write(b"hello")
 
-        assert parent._writing is False
+        assert zwf._state == write_mod.WriteState.COMMITTED
         assert zinfo in parent.filelist
         assert parent.NameToInfo["b.txt"] is zinfo
 
@@ -96,7 +95,6 @@ class TestZipWriteFile:
             match="File size unexpectedly exceeded ZIP64 limit",
         ):
             zwf.close()
-        assert parent._writing is False
         assert zwf._state.value == "failed"
 
     def test_non_zip64_compress_size_over_limit_raises(
@@ -131,7 +129,7 @@ class TestZipWriteFile:
 
         assert parent.start_dir > 0
 
-    def test_finalization_failure_clears_parent_write_state(self) -> None:
+    def test_finalization_failure_marks_writer_failed(self) -> None:
         parent = _make_parent()
         zinfo = _make_zinfo("failed.txt")
         zwf = ZipWriteFile(
@@ -148,5 +146,5 @@ class TestZipWriteFile:
                 zwf.close()
         finally:
             write_module.ZIP64_LIMIT = original
-        assert parent._writing is False
+        assert zwf._state == write_mod.WriteState.FAILED
         assert zinfo not in parent.filelist

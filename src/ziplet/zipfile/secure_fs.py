@@ -47,3 +47,15 @@ class SecureExtractionRoot:
                 raise ValueError("Refusing to traverse unsafe extraction path")
             current.mkdir(exist_ok=True)
         return current
+
+    def open_leaf_parent(self, parent: Path) -> int | None:
+        """Open a NOFOLLOW dir_fd for *parent*, already validated by
+        :meth:`ensure_parents`, so a caller can perform a ``dir_fd``-relative
+        leaf write without a TOCTOU window between validation and the write.
+
+        Returns ``None`` where descriptor support is unavailable. The caller
+        owns the returned descriptor and must close it.
+        """
+        if not self.descriptor_supported:
+            return None
+        return os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)

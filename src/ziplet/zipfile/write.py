@@ -122,7 +122,6 @@ class ZipWriteFile(io.BufferedIOBase):
         header = self._zinfo.FileHeader(self._zip64)
         # From this point onwards, we have modified the archive.
         self._zipfile._didModify = True
-        self._zipfile._writing = True
         _write_all(self._fileobj, header)
 
     def _write_encryption_header(self) -> None:
@@ -187,7 +186,8 @@ class ZipWriteFile(io.BufferedIOBase):
             RuntimeError: If a non-ZIP64 entry exceeds the 4 GiB ZIP64 limit
                 for either the uncompressed or compressed size.
         """
-        condition = getattr(self._zipfile, "_write_condition", None)
+        coordinator = getattr(self._zipfile, "_write_coordinator", None)
+        condition = coordinator.condition if coordinator is not None else None
         if condition is not None:
             with condition:
                 if self._state in (WriteState.COMMITTED, WriteState.CLOSED):
@@ -222,15 +222,9 @@ class ZipWriteFile(io.BufferedIOBase):
             self._error = exc
             self._state = WriteState.FAILED
             if self._reservation is not None:
-                self._zipfile._write_coordinator.fail(self._reservation, exc)
+                self._zipfile._write_coordinator.fail(self._reservation)
             raise
         finally:
-            self._zipfile._writing = False
-            condition = getattr(self._zipfile, "_write_condition", None)
-            if condition is not None:
-                with condition:
-                    self._zipfile._active_writer = None
-                    condition.notify_all()
             super().close()
 
     def _write_final_payload(self) -> None:

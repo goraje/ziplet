@@ -108,7 +108,7 @@ from ziplet.zipfile.validators import (
     _member_target_name,
     resolve_extract_target,
 )
-from ziplet.zipfile.write import WriteState, ZipWriteFile
+from ziplet.zipfile.write import ZipWriteFile
 from ziplet.zipfile.write_coordinator import WriteCoordinator
 
 __all__ = [
@@ -650,10 +650,7 @@ class ZipFile:
         self._fileRefCnt = 1
         self._lock = threading.RLock()
         self._write_coordinator = WriteCoordinator(self._lock)
-        self._write_condition = self._write_coordinator.condition
-        self._active_writer: ZipWriteFile | None = None
         self._seekable = True
-        self._writing = False
         self._compression_registry = selected_registry
 
         try:
@@ -1208,7 +1205,7 @@ class ZipFile:
                 ),
             )
 
-        if self._writing:
+        if self._write_coordinator.active:
             raise ValueError(
                 "Can't read from the ZIP file while there "
                 "is an open writing handle on it. "
@@ -1253,7 +1250,7 @@ class ZipFile:
             zinfo.header_offset,
             self._fpclose,
             self._lock,
-            lambda: self._writing,
+            lambda: self._write_coordinator.active,
         )
         try:
             fheader_raw = zef_file.read(sizeFileHeader)
@@ -1411,7 +1408,6 @@ class ZipFile:
         except BaseException:
             self._write_coordinator.release(reservation)
             raise
-        self._active_writer = writer
         return writer
 
     @overload
@@ -1794,19 +1790,24 @@ class ZipFile:
             targetpath = os.fspath(target_override)
 
         upperdirs = os.path.dirname(targetpath)
+        dir_fd: int | None = None
         if upperdirs:
-            self._secure_mkdirs(upperdirs)
-
-        materializer = self._materializer(member)
-        return materializer(
-            member,
-            targetpath,
-            pwd,
-            quota_member_limit,
-            quota_total_limit,
-            quota_total_written,
-            upperdirs or ".",
-        )
+            dir_fd = self._secure_mkdirs(upperdirs)
+        try:
+            materializer = self._materializer(member)
+            return materializer(
+                member,
+                targetpath,
+                pwd,
+                quota_member_limit,
+                quota_total_limit,
+                quota_total_written,
+                upperdirs or ".",
+                dir_fd,
+            )
+        finally:
+            if dir_fd is not None:
+                os.close(dir_fd)
 
     def _materializer(self, member: ZipInfo) -> Materializer:
         if member.is_dir():
@@ -1827,9 +1828,30 @@ class ZipFile:
         quota_total_limit: int | None,
         quota_total_written: int,
         directory: str,
+        dir_fd: int | None,
     ) -> MaterializationResult:
         del member, pwd, quota_member_limit, quota_total_limit, quota_total_written
         del directory
+        if dir_fd is not None and os.mkdir in os.supports_dir_fd:
+            name = os.path.basename(targetpath)
+            try:
+                leaf_stat = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                already_dir = False
+            else:
+                if stat.S_ISLNK(leaf_stat.st_mode):
+                    raise ExtractionSecurityError(
+                        "Refusing to traverse symlinked extraction directory"
+                    )
+                already_dir = stat.S_ISDIR(leaf_stat.st_mode)
+            if not already_dir:
+                try:
+                    os.mkdir(name, dir_fd=dir_fd)
+                except FileExistsError:
+                    recheck = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                    if not stat.S_ISDIR(recheck.st_mode):
+                        raise
+            return MaterializationResult(Path(targetpath), 0, already_dir)
         if os.path.lexists(targetpath) and os.path.islink(targetpath):
             raise ExtractionSecurityError(
                 "Refusing to traverse symlinked extraction directory"
@@ -1852,6 +1874,7 @@ class ZipFile:
         quota_total_limit: int | None,
         quota_total_written: int,
         directory: str,
+        dir_fd: int | None,
     ) -> MaterializationResult:
         del quota_member_limit, quota_total_limit, quota_total_written, directory
         with self.open(member, pwd=pwd) as source:
@@ -1862,6 +1885,17 @@ class ZipFile:
             raise ExtractionSecurityError(
                 "Refusing to create symlink outside extraction root"
             )
+        if dir_fd is not None and os.symlink in os.supports_dir_fd:
+            name = os.path.basename(targetpath)
+            try:
+                os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                existed = True
+            except FileNotFoundError:
+                existed = False
+            if existed:
+                os.unlink(name, dir_fd=dir_fd)
+            os.symlink(link_target, name, dir_fd=dir_fd)
+            return MaterializationResult(Path(targetpath), 0, existed)
         existed = os.path.lexists(targetpath)
         if existed:
             os.unlink(targetpath)
@@ -1877,8 +1911,15 @@ class ZipFile:
         quota_total_limit: int | None,
         quota_total_written: int,
         directory: str,
+        dir_fd: int | None,
     ) -> MaterializationResult:
         del pwd, quota_member_limit, quota_total_limit, quota_total_written, directory
+        del dir_fd
+        # ponytail: no dir_fd path for FIFO creation (os.mkfifo lacks a
+        # dir_fd parameter; os.mknod's dir_fd support is Linux-only and
+        # unconfirmed on this platform). Residual TOCTOU window between the
+        # guarded parent walk and this path-based mkfifo call. Upgrade:
+        # hasattr(os, "mknod") and os.mknod in os.supports_dir_fd, if needed.
         if stat.S_ISFIFO(_entry_mode(member)) and hasattr(os, "mkfifo"):
             existed = os.path.lexists(targetpath)
             if existed:
@@ -1896,7 +1937,9 @@ class ZipFile:
         quota_total_limit: int | None,
         quota_total_written: int,
         directory: str,
+        dir_fd: int | None,
     ) -> MaterializationResult:
+        del dir_fd
         existed = os.path.lexists(targetpath)
         temp_name: str | None = None
         bytes_written = 0
@@ -1932,13 +1975,21 @@ class ZipFile:
         return MaterializationResult(Path(targetpath), bytes_written, existed)
 
     @staticmethod
-    def _secure_mkdirs(path: str) -> None:
-        """Create parents without following pre-existing symlink components."""
+    def _secure_mkdirs(path: str) -> int | None:
+        """Create parents without following pre-existing symlink components.
+
+        Returns an open ``dir_fd`` for the final directory when the
+        platform supports ``dir_fd``-relative operations, ``None``
+        otherwise. The caller owns the returned descriptor and must close
+        it, which keeps the guard alive through the caller's own leaf
+        write instead of closing it beforehand.
+        """
         absolute = Path(os.path.abspath(path))
         root = SecureExtractionRoot(Path(absolute.anchor or os.path.sep))
         relative = tuple(part for part in absolute.parts[1:] if part)
         with root:
-            root.ensure_parents(relative)
+            parent = root.ensure_parents(relative)
+            return root.open_leaf_parent(parent)
 
     def _writecheck(self, zinfo: ZipInfo) -> None:
         """Validate that *zinfo* can be written to the archive.
@@ -2001,7 +2052,7 @@ class ZipFile:
         if not self.fp:
             raise ValueError("Attempt to write to ZIP archive that was already closed")
         self._write_coordinator.ensure_readable()
-        if self._writing:
+        if self._write_coordinator.active:
             raise ValueError(
                 "Can't write to ZIP archive while an open writing handle exists"
             )
@@ -2076,7 +2127,7 @@ class ZipFile:
 
         if not self.fp:
             raise ValueError("Attempt to write to ZIP archive that was already closed")
-        if self._writing:
+        if self._write_coordinator.active:
             raise ValueError(
                 "Can't write to ZIP archive while an open writing handle exists."
             )
@@ -2169,17 +2220,13 @@ class ZipFile:
         if self.fp is None:
             return
 
-        if self._writing:
-            with self._write_condition:
-                writer = self._active_writer
-                if writer is not None and writer._state == WriteState.FINALIZING:
-                    self._write_condition.wait_for(lambda: not self._writing)
-                if self._writing:
-                    raise ValueError(
-                        "Can't close the ZIP file while there is "
-                        "an open writing handle on it. "
-                        "Close the writing handle before closing the zip."
-                    )
+        self._write_coordinator.wait_for_finalization()
+        if self._write_coordinator.active:
+            raise ValueError(
+                "Can't close the ZIP file while there is "
+                "an open writing handle on it. "
+                "Close the writing handle before closing the zip."
+            )
 
         try:
             if self.mode in ("w", "x", "a") and self._didModify:

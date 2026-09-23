@@ -28,11 +28,14 @@ class WriteCoordinator:
         self._condition = threading.Condition(lock)
         self._state = WriterArchiveState.IDLE
         self._reservation: WriterReservation | None = None
-        self._error: BaseException | None = None
 
     @property
     def condition(self) -> threading.Condition:
         return self._condition
+
+    @property
+    def state(self) -> WriterArchiveState:
+        return self._state
 
     @property
     def active(self) -> bool:
@@ -48,7 +51,6 @@ class WriteCoordinator:
             reservation = WriterReservation(object())
             self._reservation = reservation
             self._state = WriterArchiveState.ACTIVE
-            self._error = None
             return reservation
 
     def begin_finalization(self, reservation: WriterReservation) -> None:
@@ -63,10 +65,9 @@ class WriteCoordinator:
             self._reservation = None
             self._condition.notify_all()
 
-    def fail(self, reservation: WriterReservation, error: BaseException) -> None:
+    def fail(self, reservation: WriterReservation) -> None:
         with self._condition:
             self._require(reservation)
-            self._error = error
             self._state = WriterArchiveState.FAILED
             self._reservation = None
             self._condition.notify_all()

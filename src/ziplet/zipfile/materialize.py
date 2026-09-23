@@ -30,4 +30,5 @@ class Materializer(Protocol):
         quota_total_limit: int | None,
         quota_total_written: int,
         directory: str,
+        dir_fd: int | None,
     ) -> MaterializationResult: ...

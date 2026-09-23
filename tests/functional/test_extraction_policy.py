@@ -225,3 +225,26 @@ def test_extract_policy_marks_overwritten_members(tmp_path: Path) -> None:
     assert results_by_name["existing.txt"].overwritten is True
     assert results_by_name["new.txt"].overwritten is False
     assert (destination / "existing.txt").read_bytes() == b"fresh"
+
+
+def test_dir_fd_relative_directory_materialization_rejects_leaf_symlink(
+    tmp_path: Path,
+) -> None:
+    """A directory *entry* (not an intermediate path component) whose leaf
+    name is already a symlink must be rejected via the dir_fd-relative
+    check in _materialize_directory, not just the path-based intermediate
+    walk that test_existing_symlink_directory_is_not_followed covers."""
+    archive = tmp_path / "leaf-symlink-dir.zip"
+    destination = tmp_path / "out"
+    outside = tmp_path / "outside"
+    destination.mkdir()
+    outside.mkdir()
+    (destination / "payload").symlink_to(outside, target_is_directory=True)
+    with ziplet.ZipFile(archive, "w") as zf:
+        zf.writestr("payload/", b"")
+
+    with ziplet.ZipFile(archive) as zf:
+        with pytest.raises(ziplet.ExtractionSecurityError):
+            zf.extract("payload/", destination)
+
+    assert (destination / "payload").is_symlink()
