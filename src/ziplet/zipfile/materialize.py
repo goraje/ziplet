@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from ziplet.zipfile.assessment import ExtractionContext
 from ziplet.zipfile.info import ZipInfo
 
 
@@ -23,5 +22,12 @@ class Materializer(Protocol):
     """Protocol for regular-file, directory, and special-file materializers."""
 
     def __call__(
-        self, info: ZipInfo, target: Path, context: ExtractionContext
+        self,
+        member: ZipInfo,
+        targetpath: str,
+        pwd: bytes | None,
+        quota_member_limit: int | None,
+        quota_total_limit: int | None,
+        quota_total_written: int,
+        directory: str,
     ) -> MaterializationResult: ...

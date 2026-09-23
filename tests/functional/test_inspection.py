@@ -40,3 +40,26 @@ def test_assess_returns_shared_archive_assessment(tmp_path: Path) -> None:
     assert assessment.total_uncompressed_size == len(b"payload")
     assert assessment.members[0].info.filename == "payload.txt"
     assert not (tmp_path / "output").exists()
+
+
+def test_assess_reports_archive_wide_policy_violations(tmp_path: Path) -> None:
+    archive = tmp_path / "assessment-limits.zip"
+    with ziplet.ZipFile(archive, "w") as zf:
+        zf.writestr("first.txt", b"1234567890")
+        zf.writestr("second.txt", b"more")
+
+    with ziplet.ZipFile(archive) as zf:
+        assessment = zf.assess(
+            tmp_path / "output",
+            ziplet.ExtractPolicy(
+                max_entries=1,
+                max_total_uncompressed_size=5,
+                max_compression_ratio=None,
+                on_violation=ziplet.ViolationAction.SKIP,
+            ),
+        )
+
+    codes = {v.code for v in assessment.violations}
+    assert "max_entries" in codes
+    assert "max_total_uncompressed_size" in codes
+    assert not (tmp_path / "output").exists()

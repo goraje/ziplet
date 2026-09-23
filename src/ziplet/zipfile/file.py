@@ -15,7 +15,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from pathlib import Path
 from types import TracebackType
-from typing import IO, TYPE_CHECKING, Any, Callable, Literal, TypeAlias, cast, overload
+from typing import IO, TYPE_CHECKING, Any, Literal, TypeAlias, cast, overload
 
 if TYPE_CHECKING:
     from typing_extensions import Self
@@ -45,6 +45,12 @@ from ziplet.zipfile.assessment import (
     ExtractionContext,
     ValidationState,
 )
+from ziplet.zipfile.exceptions import (
+    ExtractionFailure,
+    ExtractionMaterializationError,
+    ExtractionQuotaExceeded,
+    ExtractionSecurityError,
+)
 from ziplet.zipfile.ext import ZipExtFile
 from ziplet.zipfile.extract import (
     ExtractionError,
@@ -57,6 +63,7 @@ from ziplet.zipfile.extract import (
     OverwritePolicy,
     ViolationAction,
     normalized_destination,
+    resolve_rule,
 )
 from ziplet.zipfile.info import ZipInfo
 from ziplet.zipfile.inspection import InspectionMember, InspectionResult
@@ -64,6 +71,7 @@ from ziplet.zipfile.io_wrappers import (
     ClosableZipStream,
     Tellable,
 )
+from ziplet.zipfile.materialize import MaterializationResult, Materializer
 from ziplet.zipfile.secure_fs import SecureExtractionRoot
 from ziplet.zipfile.shared import (
     MASK_COMPRESS_OPTION_1,
@@ -92,7 +100,14 @@ from ziplet.zipfile.shared import (
     structEndArchive64Locator,
     structFileHeader,
 )
-from ziplet.zipfile.validators import ValidatorPipeline
+from ziplet.zipfile.validators import (
+    EXTRACT_VALIDATORS,
+    ValidatorPipeline,
+    _entry_mode,
+    _entry_type,
+    _member_target_name,
+    resolve_extract_target,
+)
 from ziplet.zipfile.write import WriteState, ZipWriteFile
 from ziplet.zipfile.write_coordinator import WriteCoordinator
 
@@ -124,13 +139,6 @@ INHERIT_ENCRYPTION = _InheritEncryption()
 EncryptionOverride: TypeAlias = str | None | _InheritEncryption
 
 
-class _ExtractionQuotaExceeded(Exception):
-    def __init__(self, code: str, limit: int) -> None:
-        self.code = code
-        self.limit = limit
-        super().__init__(f"{code} exceeds limit of {limit} bytes")
-
-
 class _ExtractionQuotaWriter:
     def __init__(
         self,
@@ -150,12 +158,12 @@ class _ExtractionQuotaWriter:
         requested = len(data)
         member_total = self.member_written + requested
         if self._member_limit is not None and member_total > self._member_limit:
-            raise _ExtractionQuotaExceeded("actual_member_size", self._member_limit)
+            raise ExtractionQuotaExceeded("actual_member_size", self._member_limit)
         if (
             self._total_limit is not None
             and self._total_written + member_total > self._total_limit
         ):
-            raise _ExtractionQuotaExceeded(
+            raise ExtractionQuotaExceeded(
                 "actual_total_uncompressed_size", self._total_limit
             )
         written = self._target.write(data)
@@ -498,43 +506,25 @@ class ZipFile:
         }
     )
 
-    @staticmethod
-    def _entry_mode(info: ZipInfo) -> int:
-        return (info.external_attr >> 16) & 0o170000
+    _extract_pipeline = ValidatorPipeline(EXTRACT_VALIDATORS)
 
     @classmethod
-    def _entry_type(cls, info: ZipInfo) -> tuple[bool, bool]:
-        mode = cls._entry_mode(info)
-        is_symlink = stat.S_ISLNK(mode)
-        is_special = bool(
-            mode
-            and not is_symlink
-            and not stat.S_ISREG(mode)
-            and not stat.S_ISDIR(mode)
-        )
-        return is_symlink, is_special
-
-    @classmethod
-    def _effective_violations(
-        cls,
-        violations: Iterable[ExtractViolation],
-        policy: ExtractPolicy,
+    def _apply_hard_violation_floor(
+        cls, violations: Iterable[ExtractViolation]
     ) -> list[ExtractViolation]:
+        """Escalate WARN to ERROR for codes that can never be soft-failed.
+
+        Runs after per-check violation actions are already resolved (see
+        :func:`ziplet.zipfile.extract.resolve_rule`), so this only enforces
+        the floor — it does not otherwise touch an already-resolved action.
+        """
         return [
-            ExtractViolation(
-                violation.member,
-                violation.code,
-                violation.message,
-                ViolationAction.ERROR
-                if (
-                    violation.code in cls._HARD_EXTRACTION_VIOLATIONS
-                    and policy.on_violation == ViolationAction.WARN
-                )
-                else policy.on_violation
-                if violation.action == ViolationAction.ERROR
-                else violation.action,
-                violation.target,
+            replace(violation, action=ViolationAction.ERROR)
+            if (
+                violation.code in cls._HARD_EXTRACTION_VIOLATIONS
+                and violation.action == ViolationAction.WARN
             )
+            else violation
             for violation in violations
         ]
 
@@ -544,47 +534,20 @@ class ZipFile:
         destination: Path,
         policy_root: Path,
         policy: ExtractPolicy,
-        targets: dict[Path, str],
+        state: ValidationState,
     ) -> MemberAssessment:
-        target, violations = self._evaluate_extract_member(
-            info, destination, policy_root, policy, targets
-        )
+        target, _drive, _parts = resolve_extract_target(info, destination)
         context = ExtractionContext(destination, policy_root, None, policy)
-        state = ValidationState()
-
-        def legacy_validator(
-            info: ZipInfo,
-            target: Path,
-            context: ExtractionContext,
-            state: ValidationState,
-        ) -> list[ExtractViolation]:
-            del info, target, context, state
-            return violations
-
-        pipeline = ValidatorPipeline([legacy_validator])
-        violations = pipeline.validate(info, target or destination, context, state)
+        violations = self._extract_pipeline.validate(info, target, context, state)
+        violations = self._apply_hard_violation_floor(violations)
         return MemberAssessment(
             info,
             target,
-            tuple(self._effective_violations(violations, policy)),
-            *self._entry_type(info),
+            tuple(violations),
+            *_entry_type(info),
         )
 
-    @classmethod
-    def _member_target_name(cls, raw_name: str) -> tuple[str, list[str]]:
-        target_name = raw_name.replace("/", os.path.sep)
-        drive, _ = os.path.splitdrive(raw_name)
-        if os.path.sep == "\\":
-            target_name = cls._sanitize_windows_name(target_name, os.path.sep)
-        parts = [
-            part
-            for part in target_name.split(os.path.sep)
-            if part not in ("", os.path.curdir, os.path.pardir)
-        ]
-        return drive, parts
-
     fp: IO[bytes] | None = None
-    _windows_illegal_name_trans_table: dict[int, int] | None = None
 
     def __init__(
         self,
@@ -911,19 +874,29 @@ class ZipFile:
                 max_compression_ratio=None,
             )
         )
-        destination = normalized_destination(path or os.getcwd())
-        policy_root = (
-            normalized_destination(effective_policy.destination_root)
-            if effective_policy.destination_root is not None
-            else destination
+        assessment = self.assess(path, effective_policy)
+        total_entries = len(assessment.members)
+
+        max_entries_rule = resolve_rule(
+            effective_policy.max_entries, effective_policy.on_violation
         )
-        targets: dict[Path, str] = {}
-        name_counts: dict[str, int] = {}
+        count_over = (
+            max_entries_rule.value is not None
+            and total_entries > max_entries_rule.value
+        )
+        violations: list[ExtractViolation] = list(assessment.violations)
+        if count_over:
+            violations.append(
+                ExtractViolation(
+                    "<archive>",
+                    "max_entries",
+                    f"archive contains {total_entries} entries, "
+                    f"limit is {max_entries_rule.value}",
+                    max_entries_rule.action,
+                )
+            )
+
         members: list[InspectionMember] = []
-        violations: list[ExtractViolation] = []
-        total_compressed_size = 0
-        total_size = 0
-        duplicate_targets: list[Path] = []
         encrypted: list[str] = []
         suspicious: list[str] = []
         large: list[str] = []
@@ -931,66 +904,12 @@ class ZipFile:
         symlinks: list[str] = []
         special_files: list[str] = []
 
-        count_over = (
-            effective_policy.max_entries is not None
-            and len(self.filelist) > effective_policy.max_entries
-        )
-        if count_over:
-            violations.append(
-                ExtractViolation(
-                    "<archive>",
-                    "max_entries",
-                    f"archive contains {len(self.filelist)} entries, "
-                    f"limit is {effective_policy.max_entries}",
-                    effective_policy.on_violation,
-                )
-            )
-
-        for index, info in enumerate(self.filelist):
-            name_counts[info.filename] = name_counts.get(info.filename, 0) + 1
-            before = set(targets)
-            assessment = self._assess_member(
-                info, destination, policy_root, effective_policy, targets
-            )
-            target = assessment.target
-            member_violations = list(assessment.violations)
-            # _evaluate_extract_member intentionally only records duplicates
-            # when extraction is configured to reject them.  Inspection always
-            # reports duplicate targets as an independent archive property.
-            if target is not None and target in before:
-                duplicate_targets.append(target)
-            total_size += info.file_size
-            total_compressed_size += info.compress_size
-            if (
-                effective_policy.max_total_uncompressed_size is not None
-                and total_size > effective_policy.max_total_uncompressed_size
-            ):
-                member_violations.append(
-                    ExtractViolation(
-                        info.filename,
-                        "max_total_uncompressed_size",
-                        "total declared uncompressed size exceeds policy limit",
-                        effective_policy.on_violation,
-                        target,
-                    )
-                )
-            if (
-                effective_policy.max_entries is not None
-                and index >= effective_policy.max_entries
-            ):
-                member_violations.append(
-                    ExtractViolation(
-                        info.filename,
-                        "max_entries",
-                        "archive entry count exceeds policy limit",
-                        effective_policy.on_violation,
-                        target,
-                    )
-                )
-            member_violations = self._effective_violations(
-                member_violations, effective_policy
-            )
-            is_link, is_special = self._entry_type(info)
+        for member_assessment in assessment.members:
+            info = member_assessment.info
+            target = member_assessment.target
+            member_violations = member_assessment.violations
+            is_link = member_assessment.is_symlink
+            is_special = member_assessment.is_special
             ratio = (
                 None if info.compress_size == 0 else info.file_size / info.compress_size
             )
@@ -1016,7 +935,6 @@ class ZipFile:
                 large.append(info.filename)
             if any(v.code == "compression_ratio" for v in member_violations):
                 ratio_outliers.append(info.filename)
-            violations.extend(member_violations)
             members.append(
                 InspectionMember(
                     info.filename,
@@ -1028,21 +946,18 @@ class ZipFile:
                     bool(info.flag_bits & MASK_ENCRYPTED),
                     is_link,
                     is_special,
-                    tuple(member_violations),
+                    member_violations,
                 )
             )
 
-        duplicate_names = tuple(
-            name for name, count in name_counts.items() if count > 1
-        )
         warnings = tuple(v for v in violations if v.action == ViolationAction.WARN)
         return InspectionResult(
-            len(self.filelist),
-            total_compressed_size,
-            total_size,
+            total_entries,
+            assessment.total_compressed_size,
+            assessment.total_uncompressed_size,
             tuple(members),
-            duplicate_names,
-            tuple(dict.fromkeys(duplicate_targets)),
+            assessment.duplicate_member_names,
+            assessment.duplicate_targets,
             tuple(dict.fromkeys(suspicious)),
             tuple(encrypted),
             tuple(large),
@@ -1071,32 +986,30 @@ class ZipFile:
         )
         destination = normalized_destination(path or os.getcwd())
         root = normalized_destination(effective_policy.destination_root or destination)
-        targets: dict[Path, str] = {}
+        state = ValidationState()
         members: list[MemberAssessment] = []
         violations: list[ExtractViolation] = []
-        names: dict[str, int] = {}
         duplicate_targets: list[Path] = []
-        compressed = 0
-        uncompressed = 0
         for info in self.filelist:
-            names[info.filename] = names.get(info.filename, 0) + 1
-            before = set(targets)
+            state.names[info.filename] = state.names.get(info.filename, 0) + 1
+            state.total_declared += info.file_size
+            state.total_compressed += info.compress_size
+            before = set(state.targets)
             assessment = self._assess_member(
-                info, destination, root, effective_policy, targets
+                info, destination, root, effective_policy, state
             )
+            state.member_index += 1
             if assessment.target is not None and assessment.target in before:
                 duplicate_targets.append(assessment.target)
             members.append(assessment)
             violations.extend(assessment.violations)
-            compressed += info.compress_size
-            uncompressed += info.file_size
         return ArchiveAssessment(
             destination,
             tuple(members),
             tuple(violations),
-            compressed,
-            uncompressed,
-            tuple(name for name, count in names.items() if count > 1),
+            state.total_compressed,
+            state.total_declared,
+            tuple(name for name, count in state.names.items() if count > 1),
             tuple(dict.fromkeys(duplicate_targets)),
         )
 
@@ -1556,7 +1469,7 @@ class ZipFile:
             path = os.getcwd()
         else:
             path = os.fspath(path)
-        return self._extract_member(member, path, pwd)
+        return str(self._extract_member(member, path, pwd).target)
 
     @overload
     def extractall(
@@ -1630,50 +1543,32 @@ class ZipFile:
         ]
         violations: list[ExtractViolation] = []
         results: list[ExtractMemberResult] = []
-        targets: dict[Path, str] = {}
-        total_declared = 0
+        state = ValidationState()
         total_written = 0
 
-        if policy.max_entries is not None and len(infos) > policy.max_entries:
+        max_entries_rule = resolve_rule(policy.max_entries, policy.on_violation)
+        if max_entries_rule.value is not None and len(infos) > max_entries_rule.value:
             violation = ExtractViolation(
                 "<archive>",
                 "max_entries",
-                f"archive contains {len(infos)} entries, limit is {policy.max_entries}",
-                policy.on_violation,
+                f"archive contains {len(infos)} entries, "
+                f"limit is {max_entries_rule.value}",
+                max_entries_rule.action,
             )
             violations.append(violation)
+        max_total_size_rule = resolve_rule(
+            policy.max_total_uncompressed_size, policy.on_violation
+        )
 
-        for index, info in enumerate(infos):
+        for info in infos:
+            state.total_declared += info.file_size
+            state.total_compressed += info.compress_size
             assessment = self._assess_member(
-                info, destination, policy_root, policy, targets
+                info, destination, policy_root, policy, state
             )
+            state.member_index += 1
             target = assessment.target
             member_violations = list(assessment.violations)
-            if policy.max_entries is not None and index >= policy.max_entries:
-                member_violations.append(
-                    ExtractViolation(
-                        info.filename,
-                        "max_entries",
-                        "archive entry count exceeds policy limit",
-                        policy.on_violation,
-                        target,
-                    )
-                )
-            total_declared += info.file_size
-            if (
-                policy.max_total_uncompressed_size is not None
-                and total_declared > policy.max_total_uncompressed_size
-            ):
-                member_violations.append(
-                    ExtractViolation(
-                        info.filename,
-                        "max_total_uncompressed_size",
-                        "total declared uncompressed size exceeds policy limit",
-                        policy.on_violation,
-                        target,
-                    )
-                )
-            member_violations = self._effective_violations(member_violations, policy)
             violations.extend(member_violations)
 
             action = (
@@ -1728,23 +1623,21 @@ class ZipFile:
             target = self._prepare_policy_target(target, info, policy)
             was_existing = target.exists()
             try:
-                written_target = self._extract_member(
+                materialized = self._extract_member(
                     info,
                     str(destination),
                     pwd,
                     target_override=target,
-                    quota_member_limit=policy.max_member_size,
-                    quota_total_limit=policy.max_total_uncompressed_size,
+                    quota_member_limit=resolve_rule(
+                        policy.max_member_size, policy.on_violation
+                    ).value,
+                    quota_total_limit=max_total_size_rule.value,
                     quota_total_written=total_written,
                 )
-                entry_mode = self._entry_mode(info)
-                written = (
-                    0
-                    if info.is_dir() or stat.S_ISLNK(entry_mode) or entry_mode
-                    else os.path.getsize(written_target)
-                )
+                written_target = str(materialized.target)
+                written = materialized.bytes_written
                 total_written += written
-            except _ExtractionQuotaExceeded as exc:
+            except ExtractionQuotaExceeded as exc:
                 violation = ExtractViolation(
                     info.filename,
                     exc.code,
@@ -1763,7 +1656,13 @@ class ZipFile:
                     )
                 )
                 continue
-            except (OSError, ValueError, BadZipFile, RuntimeError) as exc:
+            except (
+                OSError,
+                ValueError,
+                BadZipFile,
+                RuntimeError,
+                ExtractionFailure,
+            ) as exc:
                 violation = ExtractViolation(
                     info.filename,
                     "extraction_error",
@@ -1834,176 +1733,6 @@ class ZipFile:
             overwritten,
         )
 
-    def _evaluate_extract_member(
-        self,
-        info: ZipInfo,
-        destination: Path,
-        policy_root: Path,
-        policy: ExtractPolicy,
-        targets: dict[Path, str],
-    ) -> tuple[Path | None, list[ExtractViolation]]:
-        raw = info.orig_filename
-        drive, parts = self._member_target_name(raw)
-        violations: list[ExtractViolation] = []
-        if os.path.isabs(raw) and not policy.allow_absolute_paths:
-            violations.append(
-                self._violation(info, "absolute_path", "absolute path is not allowed")
-            )
-        if drive and not policy.allow_windows_drive_paths:
-            violations.append(
-                self._violation(
-                    info, "windows_drive_path", "Windows drive path is not allowed"
-                )
-            )
-        if (
-            drive or raw.startswith(("\\\\", "//"))
-        ) and not policy.allow_windows_drive_paths:
-            violations.append(
-                self._violation(info, "windows_path", "Windows UNC path is not allowed")
-            )
-        if (
-            ".." in raw.replace("\\", "/").split("/")
-            and not policy.allow_parent_traversal
-        ):
-            violations.append(
-                self._violation(
-                    info, "parent_traversal", "parent traversal is not allowed"
-                )
-            )
-        target = (destination / os.path.sep.join(parts)).resolve()
-        try:
-            target.relative_to(policy_root.resolve())
-        except ValueError:
-            violations.append(
-                self._violation(
-                    info, "outside_root", "target escapes destination root", target
-                )
-            )
-        if target in targets and policy.reject_duplicate_targets:
-            violations.append(
-                self._violation(
-                    info,
-                    "duplicate_target",
-                    f"target duplicates {targets[target]!r}",
-                    target,
-                )
-            )
-        else:
-            targets[target] = info.filename
-        if (
-            target.exists()
-            and not policy.allow_overwrite
-            and policy.overwrite_policy
-            not in (
-                OverwritePolicy.REPLACE,
-                OverwritePolicy.RENAME,
-            )
-        ):
-            action = (
-                ViolationAction.ERROR
-                if policy.overwrite_policy == OverwritePolicy.ERROR
-                else ViolationAction.SKIP
-            )
-            violations.append(
-                ExtractViolation(
-                    info.filename,
-                    "overwrite",
-                    "target already exists",
-                    action,
-                    target,
-                )
-            )
-        if (
-            policy.max_member_size is not None
-            and info.file_size > policy.max_member_size
-        ):
-            violations.append(
-                self._violation(
-                    info, "max_member_size", "member exceeds size limit", target
-                )
-            )
-        ratio = None if info.compress_size == 0 else info.file_size / info.compress_size
-        if (
-            policy.max_compression_ratio is not None
-            and ratio is not None
-            and ratio > policy.max_compression_ratio
-        ):
-            violations.append(
-                self._violation(
-                    info, "compression_ratio", "compression ratio exceeds limit", target
-                )
-            )
-        suffix = Path(info.filename).suffix.lower()
-        if (
-            policy.allowed_extensions is not None
-            and suffix not in policy.allowed_extensions
-        ):
-            violations.append(
-                self._violation(
-                    info, "extension_not_allowed", "extension is not allowed", target
-                )
-            )
-        if (
-            policy.blocked_extensions is not None
-            and suffix in policy.blocked_extensions
-        ):
-            violations.append(
-                self._violation(
-                    info, "extension_blocked", "extension is blocked", target
-                )
-            )
-        mode = (info.external_attr >> 16) & 0o170000
-        if stat.S_ISLNK(mode) and not policy.allow_symlinks:
-            violations.append(
-                self._violation(
-                    info, "symlink", "symlink extraction is not allowed", target
-                )
-            )
-        if (
-            mode
-            and not stat.S_ISREG(mode)
-            and not stat.S_ISDIR(mode)
-            and not stat.S_ISLNK(mode)
-            and not policy.allow_special_files
-        ):
-            violations.append(
-                self._violation(
-                    info,
-                    "special_file",
-                    "special file extraction is not allowed",
-                    target,
-                )
-            )
-        if (
-            policy.require_utf8_names
-            and not info.is_utf_filename
-            and any(ord(char) > 127 for char in info.orig_filename)
-        ):
-            violations.append(
-                self._violation(
-                    info, "non_utf8_name", "member name is not UTF-8", target
-                )
-            )
-        if policy.custom_validator is not None:
-            try:
-                policy.custom_validator(info, target)
-            except (OSError, ValueError, BadZipFile, RuntimeError) as exc:
-                violations.append(
-                    self._violation(info, "custom_validator", str(exc), target)
-                )
-        return target, violations
-
-    @staticmethod
-    def _violation(
-        info: ZipInfo,
-        code: str,
-        message: str,
-        target: Path | None = None,
-    ) -> ExtractViolation:
-        return ExtractViolation(
-            info.filename, code, message, ViolationAction.ERROR, target
-        )
-
     @staticmethod
     def _prepare_policy_target(
         target: Path,
@@ -2018,31 +1747,6 @@ class ZipFile:
                 counter += 1
         return target
 
-    @classmethod
-    def _sanitize_windows_name(cls, arcname: str, pathsep: str) -> str:
-        """Sanitize *arcname* for extraction on a Windows filesystem.
-
-        Replaces characters illegal in Windows filenames with underscores and
-        strips trailing spaces and dots from each path component.
-
-        Args:
-            arcname: Archive member name using *pathsep* as the directory
-                separator.
-            pathsep: The path separator character used in *arcname*.
-
-        Returns:
-            A sanitized copy of *arcname* safe for use as a Windows path.
-        """
-        table = cls._windows_illegal_name_trans_table
-        if not table:
-            illegal = ':<>|"?*'
-            table = str.maketrans(illegal, "_" * len(illegal))
-            cls._windows_illegal_name_trans_table = table
-        arcname = arcname.translate(table)
-        parts = (x.rstrip(" .") for x in arcname.split(pathsep))
-        arcname = pathsep.join(x for x in parts if x)
-        return arcname
-
     def _extract_member(
         self,
         member: str | ZipInfo,
@@ -2053,8 +1757,8 @@ class ZipFile:
         quota_member_limit: int | None = None,
         quota_total_limit: int | None = None,
         quota_total_written: int = 0,
-    ) -> str:
-        """Extract *member* to *targetpath* and return the resulting filesystem path.
+    ) -> MaterializationResult:
+        """Extract *member* to *targetpath* and return the materialization result.
 
         Resolves the platform path, guards against path traversal, creates
         parent directories as needed, and writes the file content (or creates
@@ -2067,7 +1771,8 @@ class ZipFile:
             pwd: Decryption password, or ``None``.
 
         Returns:
-            Absolute path of the extracted file or directory.
+            The :class:`~ziplet.zipfile.materialize.MaterializationResult`
+            describing what was written.
 
         Raises:
             ValueError: If the sanitized archive name is empty for a file
@@ -2076,7 +1781,7 @@ class ZipFile:
         if not isinstance(member, ZipInfo):
             member = self.getinfo(member)
 
-        _, parts = self._member_target_name(member.filename)
+        _, parts = _member_target_name(member.filename)
         arcname = os.path.sep.join(parts)
 
         if not arcname and not member.is_dir():
@@ -2103,10 +1808,10 @@ class ZipFile:
             upperdirs or ".",
         )
 
-    def _materializer(self, member: ZipInfo) -> Callable[..., str]:
+    def _materializer(self, member: ZipInfo) -> Materializer:
         if member.is_dir():
             return self._materialize_directory
-        mode = self._entry_mode(member)
+        mode = _entry_mode(member)
         if stat.S_ISLNK(mode):
             return self._materialize_symlink
         if mode and not stat.S_ISREG(mode) and not stat.S_ISDIR(mode):
@@ -2114,41 +1819,73 @@ class ZipFile:
         return self._materialize_regular_file
 
     def _materialize_directory(
-        self, member: ZipInfo, targetpath: str, *_args: Any
-    ) -> str:
+        self,
+        member: ZipInfo,
+        targetpath: str,
+        pwd: bytes | None,
+        quota_member_limit: int | None,
+        quota_total_limit: int | None,
+        quota_total_written: int,
+        directory: str,
+    ) -> MaterializationResult:
+        del member, pwd, quota_member_limit, quota_total_limit, quota_total_written
+        del directory
         if os.path.lexists(targetpath) and os.path.islink(targetpath):
-            raise ValueError("Refusing to traverse symlinked extraction directory")
-        if not os.path.isdir(targetpath):
+            raise ExtractionSecurityError(
+                "Refusing to traverse symlinked extraction directory"
+            )
+        existed = os.path.isdir(targetpath)
+        if not existed:
             try:
                 os.mkdir(targetpath)
             except FileExistsError:
                 if not os.path.isdir(targetpath):
                     raise
-        return targetpath
+        return MaterializationResult(Path(targetpath), 0, existed)
 
     def _materialize_symlink(
-        self, member: ZipInfo, targetpath: str, pwd: bytes | None, *_args: Any
-    ) -> str:
+        self,
+        member: ZipInfo,
+        targetpath: str,
+        pwd: bytes | None,
+        quota_member_limit: int | None,
+        quota_total_limit: int | None,
+        quota_total_written: int,
+        directory: str,
+    ) -> MaterializationResult:
+        del quota_member_limit, quota_total_limit, quota_total_written, directory
         with self.open(member, pwd=pwd) as source:
             link_target = os.fsdecode(source.read())
         if os.path.isabs(link_target) or ".." in link_target.replace("\\", "/").split(
             "/"
         ):
-            raise ValueError("Refusing to create symlink outside extraction root")
-        if os.path.lexists(targetpath):
+            raise ExtractionSecurityError(
+                "Refusing to create symlink outside extraction root"
+            )
+        existed = os.path.lexists(targetpath)
+        if existed:
             os.unlink(targetpath)
         os.symlink(link_target, targetpath)
-        return targetpath
+        return MaterializationResult(Path(targetpath), 0, existed)
 
     def _materialize_special(
-        self, member: ZipInfo, targetpath: str, *_args: Any
-    ) -> str:
-        if stat.S_ISFIFO(self._entry_mode(member)) and hasattr(os, "mkfifo"):
-            if os.path.lexists(targetpath):
+        self,
+        member: ZipInfo,
+        targetpath: str,
+        pwd: bytes | None,
+        quota_member_limit: int | None,
+        quota_total_limit: int | None,
+        quota_total_written: int,
+        directory: str,
+    ) -> MaterializationResult:
+        del pwd, quota_member_limit, quota_total_limit, quota_total_written, directory
+        if stat.S_ISFIFO(_entry_mode(member)) and hasattr(os, "mkfifo"):
+            existed = os.path.lexists(targetpath)
+            if existed:
                 os.unlink(targetpath)
             os.mkfifo(targetpath, stat.S_IMODE(member.external_attr >> 16))
-            return targetpath
-        raise ValueError("Unsupported special file type")
+            return MaterializationResult(Path(targetpath), 0, existed)
+        raise ExtractionMaterializationError("Unsupported special file type")
 
     def _materialize_regular_file(
         self,
@@ -2159,9 +1896,10 @@ class ZipFile:
         quota_total_limit: int | None,
         quota_total_written: int,
         directory: str,
-    ) -> str:
-
+    ) -> MaterializationResult:
+        existed = os.path.lexists(targetpath)
         temp_name: str | None = None
+        bytes_written = 0
         try:
             with tempfile.NamedTemporaryFile(
                 mode="wb", dir=directory, prefix=".ziplet-", delete=False
@@ -2181,6 +1919,7 @@ class ZipFile:
                         shutil.copyfileobj(source, quota_target)
                 target.flush()
                 os.fsync(target.fileno())
+                bytes_written = target.tell()
             os.replace(temp_name, targetpath)
             temp_name = None
         finally:
@@ -2190,7 +1929,7 @@ class ZipFile:
                 except FileNotFoundError:
                     pass
 
-        return targetpath
+        return MaterializationResult(Path(targetpath), bytes_written, existed)
 
     @staticmethod
     def _secure_mkdirs(path: str) -> None:

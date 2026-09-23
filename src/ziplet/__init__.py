@@ -8,10 +8,17 @@ from ziplet.compression import (
 )
 from ziplet.cryptography import WZ_AES, WZ_AES_V1, WZ_AES_V2, ZIP_CRYPTO
 from ziplet.zipfile.assessment import ArchiveAssessment, ExtractionContext
+from ziplet.zipfile.exceptions import (
+    ExtractionFailure,
+    ExtractionMaterializationError,
+    ExtractionQuotaExceeded,
+    ExtractionSecurityError,
+)
 from ziplet.zipfile.extract import (
     ExtractionError,
     ExtractMemberResult,
     ExtractPolicy,
+    ExtractPolicyRule,
     ExtractResult,
     ExtractViolation,
     MemberAssessment,
@@ -49,9 +56,14 @@ __all__ = [
     "EncryptionOverride",
     "ExtractMemberResult",
     "ExtractPolicy",
+    "ExtractPolicyRule",
     "ExtractResult",
     "ExtractViolation",
     "ExtractionError",
+    "ExtractionFailure",
+    "ExtractionMaterializationError",
+    "ExtractionQuotaExceeded",
+    "ExtractionSecurityError",
     "MemberStatus",
     "MemberAssessment",
     "ArchiveAssessment",

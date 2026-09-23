@@ -146,3 +146,82 @@ def test_existing_symlink_directory_is_not_followed(tmp_path: Path) -> None:
             )
 
     assert not (outside / "payload.txt").exists()
+
+
+def test_extract_policy_rule_overrides_default_violation_action(tmp_path: Path) -> None:
+    archive = tmp_path / "rule-override.zip"
+    with ziplet.ZipFile(archive, "w") as zf:
+        zf.writestr("safe.txt", b"safe")
+        zf.writestr("/absolute.txt", b"blocked-by-default")
+        zf.writestr("../escape.txt", b"blocked-by-rule")
+
+    with ziplet.ZipFile(archive) as zf:
+        with pytest.raises(ziplet.ExtractionError) as excinfo:
+            zf.extractall(
+                tmp_path / "out",
+                policy=ziplet.ExtractPolicy(
+                    max_compression_ratio=None,
+                    on_violation=ziplet.ViolationAction.SKIP,
+                    allow_parent_traversal=ziplet.ExtractPolicyRule(
+                        False, on_violation=ziplet.ViolationAction.ERROR
+                    ),
+                ),
+            )
+
+    result = excinfo.value.result
+    assert result.extracted_count == 1
+    assert result.skipped_count == 1
+    assert result.failed_count == 1
+    actions_by_code = {v.code: v.action for v in result.violations}
+    assert actions_by_code["absolute_path"] == ziplet.ViolationAction.SKIP
+    assert actions_by_code["parent_traversal"] == ziplet.ViolationAction.ERROR
+
+
+def test_plain_extract_symlink_escape_raises_security_error(tmp_path: Path) -> None:
+    archive = tmp_path / "symlink-escape.zip"
+    link = ZipInfo("link")
+    link.external_attr = (stat.S_IFLNK | 0o777) << 16
+    with ziplet.ZipFile(archive, "w") as zf:
+        zf.writestr(link, "../outside")
+
+    with ziplet.ZipFile(archive) as zf:
+        with pytest.raises(ziplet.ExtractionSecurityError):
+            zf.extract("link", tmp_path / "out")
+
+
+def test_plain_extract_unsupported_special_file_raises_materialization_error(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "special-file.zip"
+    device = ZipInfo("device")
+    device.external_attr = stat.S_IFCHR << 16
+    with ziplet.ZipFile(archive, "w") as zf:
+        zf.writestr(device, b"")
+
+    with ziplet.ZipFile(archive) as zf:
+        with pytest.raises(ziplet.ExtractionMaterializationError):
+            zf.extract("device", tmp_path / "out")
+
+
+def test_extract_policy_marks_overwritten_members(tmp_path: Path) -> None:
+    archive = tmp_path / "overwrite.zip"
+    destination = tmp_path / "out"
+    destination.mkdir()
+    (destination / "existing.txt").write_bytes(b"stale")
+    with ziplet.ZipFile(archive, "w") as zf:
+        zf.writestr("existing.txt", b"fresh")
+        zf.writestr("new.txt", b"new")
+
+    with ziplet.ZipFile(archive) as zf:
+        result = zf.extractall(
+            destination,
+            policy=ziplet.ExtractPolicy(
+                max_compression_ratio=None,
+                overwrite_policy=ziplet.OverwritePolicy.REPLACE,
+            ),
+        )
+
+    results_by_name = {r.member: r for r in result.members}
+    assert results_by_name["existing.txt"].overwritten is True
+    assert results_by_name["new.txt"].overwritten is False
+    assert (destination / "existing.txt").read_bytes() == b"fresh"

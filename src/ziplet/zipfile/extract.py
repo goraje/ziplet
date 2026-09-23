@@ -6,7 +6,7 @@ import os
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Generic, TypeVar
 
 if TYPE_CHECKING:
     from ziplet.zipfile.info import ZipInfo
@@ -15,6 +15,7 @@ __all__ = [
     "MemberAssessment",
     "ExtractMemberResult",
     "ExtractPolicy",
+    "ExtractPolicyRule",
     "ExtractResult",
     "ExtractViolation",
     "ExtractionError",
@@ -22,6 +23,8 @@ __all__ = [
     "OverwritePolicy",
     "ViolationAction",
 ]
+
+_T = TypeVar("_T")
 
 
 class OverwritePolicy(str, Enum):
@@ -45,23 +48,63 @@ class MemberStatus(str, Enum):
 
 
 @dataclass(frozen=True)
+class ExtractPolicyRule(Generic[_T]):
+    """Wraps a policy field value with its own :class:`ViolationAction`.
+
+    Lets a single field override the archive-wide ``on_violation`` default,
+    e.g. ``max_compression_ratio=ExtractPolicyRule(100.0,
+    on_violation=ViolationAction.ERROR)``.
+    """
+
+    value: _T
+    on_violation: ViolationAction | None = None
+
+
+@dataclass(frozen=True)
+class ResolvedRule(Generic[_T]):
+    """The value and effective :class:`ViolationAction` for one policy field.
+
+    A plain (non-tuple) dataclass so mypy's generic inference stays exact —
+    wrapping this in ``tuple[...]`` instead makes it infer an overly wide
+    type for the value on some call shapes.
+    """
+
+    value: _T
+    action: ViolationAction
+
+
+def resolve_rule(
+    field_value: _T | ExtractPolicyRule[_T] | None,
+    default_action: ViolationAction,
+) -> ResolvedRule[_T | None]:
+    """Unwrap *field_value*, returning its value and effective action."""
+    if isinstance(field_value, ExtractPolicyRule):
+        return ResolvedRule(
+            field_value.value, field_value.on_violation or default_action
+        )
+    return ResolvedRule(field_value, default_action)
+
+
+@dataclass(frozen=True)
 class ExtractPolicy:
     destination_root: Path | None = None
-    allow_absolute_paths: bool = False
-    allow_parent_traversal: bool = False
-    allow_windows_drive_paths: bool = False
-    allow_symlinks: bool = False
-    allow_special_files: bool = False
+    allow_absolute_paths: bool | ExtractPolicyRule[bool] = False
+    allow_parent_traversal: bool | ExtractPolicyRule[bool] = False
+    allow_windows_drive_paths: bool | ExtractPolicyRule[bool] = False
+    allow_symlinks: bool | ExtractPolicyRule[bool] = False
+    allow_special_files: bool | ExtractPolicyRule[bool] = False
     allow_overwrite: bool = False
     overwrite_policy: OverwritePolicy = OverwritePolicy.ERROR
-    max_member_size: int | None = 256 * 1024 * 1024
-    max_total_uncompressed_size: int | None = 1 * 1024 * 1024 * 1024
-    max_entries: int | None = 10_000
-    max_compression_ratio: float | None = 100.0
-    allowed_extensions: frozenset[str] | None = None
-    blocked_extensions: frozenset[str] | None = None
-    require_utf8_names: bool = True
-    reject_duplicate_targets: bool = True
+    max_member_size: int | ExtractPolicyRule[int] | None = 256 * 1024 * 1024
+    max_total_uncompressed_size: int | ExtractPolicyRule[int] | None = (
+        1 * 1024 * 1024 * 1024
+    )
+    max_entries: int | ExtractPolicyRule[int] | None = 10_000
+    max_compression_ratio: float | ExtractPolicyRule[float] | None = 100.0
+    allowed_extensions: frozenset[str] | ExtractPolicyRule[frozenset[str]] | None = None
+    blocked_extensions: frozenset[str] | ExtractPolicyRule[frozenset[str]] | None = None
+    require_utf8_names: bool | ExtractPolicyRule[bool] = True
+    reject_duplicate_targets: bool | ExtractPolicyRule[bool] = True
     on_violation: ViolationAction = ViolationAction.ERROR
     preview_only: bool = False
     custom_validator: Callable[["ZipInfo", Path], None] | None = None
